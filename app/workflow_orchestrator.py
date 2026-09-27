@@ -19,7 +19,9 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import rca_status
 from app.checks import has_implementation
+from app.classification import FULLY_CLASSIFIED_STATUSES
 from app.config import RCA_SYNTHESIS_LLM_ENABLED
 from app.correlation import build_correlation_context, correlate_incident
 from app.function_registry import FUNCTION_REGISTRY
@@ -346,6 +348,7 @@ async def execute_and_record(
         id=str(uuid.uuid4()),
         jira_key=jira_key,
         incident_id=incident_id,
+        incident_key=await _incident_key_for(session, incident_id),
         workflow_definition_version_id=version.id,
         document_snapshot=version.document,
         triggered_by=triggered_by,
@@ -406,6 +409,8 @@ async def record_unexecuted_attempt(
     incident_id: str | None,
     rca: dict,
     triggered_by: str = "rca",
+    requested_by: str | None = None,
+    operator_context: str | None = None,
 ) -> WorkflowExecution:
     """Records an RCA attempt that never reached an executable workflow --
     no playbook configured for the (source_system, category), or
@@ -417,15 +422,101 @@ async def record_unexecuted_attempt(
         id=str(uuid.uuid4()),
         jira_key=jira_key,
         incident_id=incident_id,
+        incident_key=await _incident_key_for(session, incident_id),
         workflow_definition_version_id=None,
         document_snapshot=[],
         evidence=[],
         rca=rca,
         rca_status=rca["rca_status"],
         triggered_by=triggered_by,
+        requested_by=requested_by,
+        operator_context=operator_context,
         status="completed",
         completed_at=datetime.datetime.now(datetime.timezone.utc),
     )
     session.add(execution)
     await session.commit()
     return execution
+
+
+async def _incident_key_for(session: AsyncSession, incident_id: str | None) -> str | None:
+    if incident_id is None:
+        return None
+    incident = await session.get(Incident, incident_id)
+    return incident.incident_key if incident is not None else None
+
+
+def no_playbook_rca(source_system_id: str, category: str) -> dict:
+    return {
+        "matched_pattern": "no_playbook",
+        "rca_status": rca_status.NEED_MANUAL_INTERVENTION,
+        "root_cause_summary": f"No RCA playbook configured yet for ({source_system_id}, {category}).",
+        "contributing_factors": [],
+        "recommended_actions": ["Author an RCA_PLAYBOOK for this (source_system, category) pair"],
+    }
+
+
+def not_classified_rca(classification_status: str) -> dict:
+    return {
+        "matched_pattern": "not_classified",
+        "rca_status": rca_status.NEED_MANUAL_INTERVENTION,
+        "root_cause_summary": f"Could not classify this incident (status={classification_status}).",
+        "contributing_factors": [],
+        "recommended_actions": ["Route for manual triage"],
+    }
+
+
+async def run_rca_for_incident(
+    session: AsyncSession,
+    incident: Incident,
+    *,
+    triggered_by: str,
+    version: WorkflowDefinitionVersion | None = None,
+    requested_by: str | None = None,
+    operator_context: str | None = None,
+) -> WorkflowExecution:
+    """One RCA attempt for an already-classified incident, recorded as a
+    WorkflowExecution whatever the outcome: runs `version` if given (a
+    retry override), else the active playbook for the incident's
+    (source_system, category); records 'no playbook' / 'not classified'
+    when there is nothing to run. Shared by the worker's automatic RCA,
+    retry, and POST /rca/{jira_key}."""
+    if version is None:
+        if incident.classification_status not in FULLY_CLASSIFIED_STATUSES:
+            return await record_unexecuted_attempt(
+                session,
+                jira_key=incident.jira_key,
+                incident_id=incident.id,
+                rca=not_classified_rca(incident.classification_status),
+                triggered_by=triggered_by,
+                requested_by=requested_by,
+                operator_context=operator_context,
+            )
+        version = await get_active_workflow(session, incident.source_system_id, incident.category)
+        if version is None:
+            return await record_unexecuted_attempt(
+                session,
+                jira_key=incident.jira_key,
+                incident_id=incident.id,
+                rca=no_playbook_rca(incident.source_system_id, incident.category),
+                triggered_by=triggered_by,
+                requested_by=requested_by,
+                operator_context=operator_context,
+            )
+        mapping_overridden = False
+    else:
+        active = None
+        if incident.classification_status in FULLY_CLASSIFIED_STATUSES:
+            active = await get_active_workflow(session, incident.source_system_id, incident.category)
+        mapping_overridden = active is None or version.id != active.id
+
+    return await execute_and_record(
+        session,
+        version,
+        jira_key=incident.jira_key,
+        incident_id=incident.id,
+        triggered_by=triggered_by,
+        mapping_overridden=mapping_overridden,
+        requested_by=requested_by,
+        operator_context=operator_context,
+    )

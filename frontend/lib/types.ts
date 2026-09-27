@@ -589,7 +589,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List Executions */
+        /**
+         * List Executions
+         * @description Newest first. incident_key is the usual filter (every incident has
+         *     one); jira_key still works for Jira-sourced runs.
+         */
         get: operations["list_executions_workflows_executions_get"];
         put?: never;
         post?: never;
@@ -710,7 +714,8 @@ export interface paths {
          * @description Fetches jira_key fresh from Jira Cloud, classifies it, executes its
          *     active workflow (if any), and returns the synthesized RCA -- the API
          *     equivalent of `uv run python -m scripts.e2e_rca <jira_key>`. Requires
-         *     JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN to be configured.
+         *     JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN to be configured. A ticket Jira
+         *     doesn't have is a 404; any other Jira failure is a 502.
          */
         post: operations["trigger_rca_rca__jira_key__post"];
         delete?: never;
@@ -719,7 +724,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/incidents/{jira_key}/retry": {
+    "/incidents/{incident_key}/retry": {
         parameters: {
             query?: never;
             header?: never;
@@ -730,15 +735,18 @@ export interface paths {
         put?: never;
         /**
          * Retry Incident
-         * @description Re-runs RCA against an already-ingested incident (no fresh Jira
-         *     fetch, unlike POST /rca/{jira_key} -- retry is for re-diagnosing known
-         *     incidents, not re-fetching them) -- either the currently-active
-         *     workflow, or an explicit version override (any approved-or-superseded
-         *     version). Every retry is its own WorkflowExecution
-         *     row, so retry history is just
-         *     GET /workflows/executions?jira_key=.
+         * @description Reprocesses an already-ingested incident, found by its incident_key
+         *     (its Jira key, or its generated int_... key). No fresh Jira fetch --
+         *     that's POST /rca/{jira_key}.
+         *
+         *     The stored incident text is re-classified against the current mapping
+         *     rules first, so a fixed rule takes effect; then the now-active playbook
+         *     runs, or the explicit version override (any approved-or-superseded
+         *     version). When there's nothing to run (no playbook / not classified)
+         *     that outcome is recorded rather than rejected. Every retry is its own
+         *     WorkflowExecution row: history is GET /workflows/executions?incident_key=.
          */
-        post: operations["retry_incident_incidents__jira_key__retry_post"];
+        post: operations["retry_incident_incidents__incident_key__retry_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -905,6 +913,8 @@ export interface components {
         IncidentDashboardOut: {
             /** Id */
             id: string;
+            /** Incident Key */
+            incident_key: string;
             /** Source */
             source: string;
             /** External Id */
@@ -989,6 +999,8 @@ export interface components {
         IncidentOut: {
             /** Id */
             id: string;
+            /** Incident Key */
+            incident_key: string;
             /** Source */
             source: string;
             /** External Id */
@@ -1166,6 +1178,8 @@ export interface components {
         RcaResultOut: {
             /** Jira Key */
             jira_key: string;
+            /** Incident Key */
+            incident_key: string;
             /** Summary */
             summary: string;
             /** Status */
@@ -1406,6 +1420,8 @@ export interface components {
             jira_key: string | null;
             /** Incident Id */
             incident_id: string | null;
+            /** Incident Key */
+            incident_key?: string | null;
             /** Workflow Definition Version Id */
             workflow_definition_version_id: string | null;
             /** Document Snapshot */
@@ -3001,6 +3017,7 @@ export interface operations {
         parameters: {
             query?: {
                 jira_key?: string | null;
+                incident_key?: string | null;
             };
             header?: never;
             path?: never;
@@ -3262,12 +3279,12 @@ export interface operations {
             };
         };
     };
-    retry_incident_incidents__jira_key__retry_post: {
+    retry_incident_incidents__incident_key__retry_post: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                jira_key: string;
+                incident_key: string;
             };
             cookie?: never;
         };

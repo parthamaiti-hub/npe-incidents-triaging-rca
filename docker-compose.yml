@@ -8,13 +8,13 @@ services:
     environment:
       POSTGRES_USER: npe
       POSTGRES_PASSWORD: npe
-      POSTGRES_DB: npe_triage
+      POSTGRES_DB: npe_triage_rca
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U npe -d npe_triage"]
+      test: ["CMD-SHELL", "pg_isready -U npe -d npe_triage_rca"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -22,7 +22,7 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
@@ -30,12 +30,12 @@ services:
       retries: 5
 
   # incident triage -- POST /incidents/{jira_key}/retry already covers
-  # visibility for local dev (localhost:15672, guest/guest).
+  # visibility for local dev (localhost:15673, guest/guest).
   rabbitmq:
     image: rabbitmq:3-management-alpine
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "5673:5672"
+      - "15673:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -48,14 +48,14 @@ services:
     volumes:
       - ./opa/policies:/policies:ro
     ports:
-      - "8181:8181"
+      - "8182:8181"
 
   frontend:
     build: ./frontend
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
-      BACKEND_URL: http://host.docker.internal:8420
+      BACKEND_URL: http://host.docker.internal:8421
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

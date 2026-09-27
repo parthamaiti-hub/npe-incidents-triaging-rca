@@ -21,7 +21,9 @@ test("browse a check type's parameters and source, and switch versions", async (
 
   // Parameters render as a read-only contract table (name/type/required),
   // not bound values.
-  await expect(page.getByText("Parameters")).toBeVisible();
+  // By role: the page subtitle also contains "parameters", so a text match
+  // would hit two elements once the detail has loaded.
+  await expect(page.getByRole("heading", { name: "Parameters" })).toBeVisible();
   const paramsTable = page.locator("table").first();
   await expect(paramsTable.getByText("env")).toBeVisible();
 

@@ -9,7 +9,7 @@ import { IncidentFilters } from "@/components/IncidentFilters";
 import { useOperatorIdentity } from "@/components/OperatorIdentityProvider";
 import { classificationBadgeClass, classificationMethodAnnotation, classificationStatusLabel } from "@/lib/classification";
 import { useIncidentsDashboard, useRetryIncident } from "@/lib/queries/incidents";
-import { useExecution, useExecutionsForJiraKey, useWorkflowDefinitions, useWorkflowVersions } from "@/lib/queries/workflows";
+import { useExecution, useExecutionsForIncident, useWorkflowDefinitions, useWorkflowVersions } from "@/lib/queries/workflows";
 import { humanizeRcaStatus, rcaStatusBadgeClass } from "@/lib/rca";
 
 const PAGE_SIZE = 20;
@@ -32,7 +32,7 @@ export default function RetryPage() {
 function RetryPageContent() {
   const searchParams = useSearchParams();
   const offset = Number(searchParams.get("offset") ?? "0");
-  const [selectedJiraKey, setSelectedJiraKey] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const { data, isLoading, isError } = useIncidentsDashboard({
     q: searchParams.get("q") || undefined,
@@ -46,7 +46,7 @@ function RetryPageContent() {
     offset,
   });
 
-  const selectedIncident = data?.items.find((item) => item.jira_key === selectedJiraKey) ?? null;
+  const selectedIncident = data?.items.find((item) => item.incident_key === selectedKey) ?? null;
 
   return (
     <main className="p-6">
@@ -63,7 +63,7 @@ function RetryPageContent() {
               <thead>
                 <tr className="border-b border-grid text-left text-xs uppercase tracking-wide text-muted">
                   <th className="px-3 py-2"></th>
-                  <th className="px-3 py-2">Jira Key</th>
+                  <th className="px-3 py-2">Incident ID</th>
                   <th className="px-3 py-2">Classification</th>
                   <th className="px-3 py-2">RCA Outcome</th>
                 </tr>
@@ -72,15 +72,15 @@ function RetryPageContent() {
                 {data.items.map((row) => (
                   <tr
                     key={row.id}
-                    onClick={() => setSelectedJiraKey(row.jira_key)}
+                    onClick={() => setSelectedKey(row.incident_key)}
                     className={`cursor-pointer border-b border-grid last:border-0 hover:bg-canvas ${
-                      row.jira_key === selectedJiraKey ? "bg-canvas" : ""
+                      row.incident_key === selectedKey ? "bg-canvas" : ""
                     }`}
                   >
                     <td className="px-3 py-2">
-                      <input type="radio" checked={row.jira_key === selectedJiraKey} readOnly disabled={!row.jira_key} />
+                      <input type="radio" checked={row.incident_key === selectedKey} readOnly aria-label={`Select ${row.incident_key}`} />
                     </td>
-                    <td className="px-3 py-2 font-medium text-heading">{row.jira_key ?? "—"}</td>
+                    <td className="px-3 py-2 font-medium text-heading">{row.incident_key}</td>
                     <td className="px-3 py-2">
                       <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${classificationBadgeClass(row.classification_status)}`}>
                         {classificationStatusLabel(row.classification_status)}
@@ -121,14 +121,14 @@ function RetryPageContent() {
 }
 
 function RetryPanel({ incident }: { incident: IncidentRow }) {
-  const jiraKey = incident.jira_key!;
+  const incidentKey = incident.incident_key;
   const { data: definitions } = useWorkflowDefinitions();
   const definition = definitions?.find(
     (d) => d.source_system_id === incident.source_system_id && d.category === incident.category,
   );
   const { data: versions } = useWorkflowVersions(definition?.id);
   const { data: latestExecution } = useExecution(incident.latest_execution_id ?? undefined);
-  const { data: history } = useExecutionsForJiraKey(jiraKey);
+  const { data: history } = useExecutionsForIncident(incidentKey);
 
   const { name: requestedBy } = useOperatorIdentity();
   const [overrideEnabled, setOverrideEnabled] = useState(false);
@@ -144,7 +144,7 @@ function RetryPanel({ incident }: { incident: IncidentRow }) {
     if (!requestedBy) return;
     const override = overrideEnabled ? overrideSelectRef.current?.value : undefined;
     retry.mutate({
-      jiraKey,
+      incidentKey,
       workflowDefinitionVersionId: override || undefined,
       requestedBy,
       operatorContext: operatorContext.trim() || undefined,
@@ -154,8 +154,12 @@ function RetryPanel({ incident }: { incident: IncidentRow }) {
   return (
     <div className="space-y-4">
       <div className="rounded-md border border-grid bg-white p-4">
-        <h2 className="text-sm font-semibold text-heading">{incident.jira_key}</h2>
+        <h2 className="text-sm font-semibold text-heading">{incident.incident_key}</h2>
         <p className="text-xs text-muted">{incident.subject}</p>
+        <p className="mt-2 text-xs text-muted">
+          Execute re-classifies this incident with the current mapping rules, then runs the active playbook -- so fixed rules
+          and playbook changes take effect.
+        </p>
 
         <p className="mt-2 text-xs text-muted">
           Current mapping:{" "}
@@ -215,7 +219,7 @@ function RetryPanel({ incident }: { incident: IncidentRow }) {
       {retry.isSuccess && retry.data && (
         <div className="rounded-md border border-grid bg-white p-4">
           <p className="text-xs text-muted">
-            {retry.data.mapping_overridden ? "Mapping overridden for this run" : "Ran the active workflow"} &middot; triggered_by=
+            {retry.data.workflow_definition_version_id == null ? "Nothing to run -- outcome recorded" : retry.data.mapping_overridden ? "Mapping overridden for this run" : "Ran the active workflow"} &middot; triggered_by=
             {retry.data.triggered_by}
           </p>
           <div className="mt-3">
@@ -230,7 +234,7 @@ function RetryPanel({ incident }: { incident: IncidentRow }) {
         <ul className="mt-2 divide-y divide-grid text-sm">
           {history?.map((execution) => (
             <li key={execution.id} className="flex items-center justify-between py-2">
-              <Link href={`/${jiraKey}/executions/${execution.id}`} className="text-focus hover:underline">
+              <Link href={`/${incidentKey}/executions/${execution.id}`} className="text-focus hover:underline">
                 {new Date(execution.started_at).toLocaleString()}
               </Link>
               <span className="text-xs text-muted">

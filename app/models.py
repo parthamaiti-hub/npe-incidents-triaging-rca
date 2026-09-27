@@ -2,7 +2,7 @@ import datetime
 import uuid
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Sequence, UniqueConstraint, event, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -218,12 +218,16 @@ class WorkflowExecution(Base):
     __tablename__ = "workflow_execution"
     __table_args__ = (
         CheckConstraint("status in ('running','completed','failed')", name="ck_we_status"),
-        CheckConstraint("triggered_by in ('rca','manual_execute','retry')", name="ck_we_triggered_by"),
+        # auto: the worker's RCA right after classification.
+        CheckConstraint("triggered_by in ('rca','manual_execute','retry','auto')", name="ck_we_triggered_by"),
     )
 
     id: Mapped[str] = mapped_column(primary_key=True, default=lambda: str(uuid.uuid4()))
     jira_key: Mapped[str | None]
     incident_id: Mapped[str | None] = mapped_column(ForeignKey("incident.id"))
+    # The incident's operator-facing key at the time of the run (see
+    # Incident.incident_key); what execution history is filtered by.
+    incident_key: Mapped[str | None] = mapped_column(index=True)
     workflow_definition_version_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_definition_version.id"))
     document_snapshot: Mapped[list[dict]] = mapped_column(JSONB)
     evidence: Mapped[list[dict] | None] = mapped_column(JSONB)
@@ -384,19 +388,45 @@ class CorrelationGroup(Base):
     status: Mapped[str] = mapped_column(default="open")
 
 
+# Running number for generated incident keys: 00001..99999, then wraps.
+# A database sequence (not an in-process counter) so the API, the worker and
+# the poller never hand out the same number, and restarts don't reset it.
+INCIDENT_KEY_SEQUENCE = Sequence(
+    "incident_key_seq", start=1, minvalue=1, maxvalue=99999, cycle=True, metadata=Base.metadata
+)
+
+# int_<MMDDYYYYHHMMSS in UTC>_<5-digit running number>, e.g. int_09272026142530_00001.
+GENERATED_INCIDENT_KEY_SQL = (
+    "'int_' || to_char(now() AT TIME ZONE 'UTC', 'MMDDYYYYHH24MISS') "
+    "|| '_' || lpad(nextval('incident_key_seq')::text, 5, '0')"
+)
+
+
 class Incident(Base):
     """An ingested incident and its classification outcome. Fields mirror
-    real Jira issue data plus the signals extracted from its text."""
+    real Jira issue data plus the signals extracted from its text.
+
+    incident_key is the one operator-facing ID every incident has -- the
+    dashboard, detail page, Retry tab and execution history all use it. It
+    is the Jira key when the incident arrived with one; otherwise the
+    database generates an internal key (GENERATED_INCIDENT_KEY_SQL), so
+    webhook incidents without a Jira ticket can still be found and
+    reprocessed. It never changes once assigned."""
 
     __tablename__ = "incident"
     __table_args__ = (UniqueConstraint("source", "external_id", name="uq_incident_source_external_id"),)
+    # Fetch the server-generated incident_key back on INSERT (RETURNING).
+    __mapper_args__ = {"eager_defaults": True}
 
     id: Mapped[str] = mapped_column(primary_key=True, default=lambda: str(uuid.uuid4()))
+    incident_key: Mapped[str] = mapped_column(unique=True, server_default=text(GENERATED_INCIDENT_KEY_SQL))
     source: Mapped[str]
     external_id: Mapped[str]
     raw_text: Mapped[str]
     subject: Mapped[str | None]
 
+    # Only ever a real Jira issue key -- anything that talks to Jira uses this,
+    # never incident_key.
     jira_key: Mapped[str | None] = mapped_column(unique=True)
     status: Mapped[str | None]
     priority: Mapped[str | None]
@@ -438,3 +468,12 @@ class Incident(Base):
     )
 
     received_at: Mapped[datetime.datetime] = mapped_column(server_default=func.now())
+
+
+@event.listens_for(Incident, "before_insert")
+def _jira_key_is_the_incident_key(mapper, connection, incident: Incident) -> None:
+    """An incident that arrives with a Jira key is known by it; only
+    incidents without one get a generated int_... key (the column's server
+    default, which applies when incident_key is left unset)."""
+    if incident.incident_key is None and incident.jira_key is not None:
+        incident.incident_key = incident.jira_key

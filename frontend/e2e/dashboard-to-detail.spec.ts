@@ -1,6 +1,6 @@
 import { expect, test } from "./fixtures";
 
-const BACKEND_URL = process.env.BACKEND_URL_FOR_TESTS ?? "http://localhost:8420";
+const BACKEND_URL = process.env.BACKEND_URL_FOR_TESTS ?? "http://localhost:8421";
 
 // Happy path: dashboard -> incident detail. Seeds via
 // the real backend (a live RCA run against a known-real ticket -- this

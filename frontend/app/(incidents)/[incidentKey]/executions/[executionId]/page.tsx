@@ -11,7 +11,7 @@ import { useExecution } from "@/lib/queries/workflows";
 // (its latest execution) and the retry page's just-returned result, all
 // via the same `ExecutionView` component.
 export default function ExecutionDetailPage() {
-  const { jiraKey, executionId } = useParams<{ jiraKey: string; executionId: string }>();
+  const { incidentKey, executionId } = useParams<{ incidentKey: string; executionId: string }>();
   const { data: execution, isLoading, isError } = useExecution(executionId);
 
   if (isLoading) {
@@ -32,8 +32,8 @@ export default function ExecutionDetailPage() {
 
   return (
     <main className="p-6">
-      <Link href={`/${jiraKey}`} className="text-sm text-focus hover:underline">
-        &larr; back to {jiraKey}
+      <Link href={`/${incidentKey}`} className="text-sm text-focus hover:underline">
+        &larr; back to {incidentKey}
       </Link>
       <h1 className="mt-2 text-xl font-semibold text-heading">Execution</h1>
       <div className="mt-1 flex flex-wrap items-center gap-3 text-sm text-muted">

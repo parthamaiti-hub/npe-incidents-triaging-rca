@@ -107,6 +107,17 @@ async def classify_raw_text(session: AsyncSession, raw_text: str, client: AsyncO
     return await classify_with_llm_fallback(session, llm_client, raw_text, result)
 
 
+def apply_classification(incident, result: dict) -> None:
+    """Writes a classify_raw_text result onto an Incident -- the one place
+    the worker, POST /rca and retry all record classification."""
+    incident.classification_status = result["status"]
+    incident.matched_rule_id = result["matched_rule_id"]
+    incident.source_system_id = result["source_system_id"]
+    incident.category = result["category"]
+    incident.classification_method = result["classification_method"]
+    incident.llm_confidence = result["llm_confidence"]
+
+
 async def _valid_categories_for(session: AsyncSession, source_system_id: str) -> list[str]:
     """Closed set for the category-only LLM mode -- categories that already
     have an IncidentMappingRule or WorkflowDefinition row for this system,

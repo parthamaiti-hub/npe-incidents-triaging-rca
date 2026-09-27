@@ -65,7 +65,7 @@ function IncidentsPageContent() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-grid text-left text-xs uppercase tracking-wide text-muted">
-                  <th className="px-3 py-2">Jira Key</th>
+                  <th className="px-3 py-2">Incident ID</th>
                   <th className="px-3 py-2">Subject</th>
                   <th className="px-3 py-2">Classification</th>
                   <th className="px-3 py-2">RCA Outcome</th>
@@ -79,13 +79,10 @@ function IncidentsPageContent() {
                 {data?.items.map((row) => (
                   <tr key={row.id} className="border-b border-grid last:border-0 hover:bg-canvas">
                     <td className="px-3 py-2">
-                      {row.jira_key ? (
-                        <Link href={`/${row.jira_key}`} className="font-medium text-focus hover:underline">
-                          {row.jira_key}
-                        </Link>
-                      ) : (
-                        "—"
-                      )}
+                      {/* Every incident has an incident_key: its Jira key, or a generated int_... ID. */}
+                      <Link href={`/${row.incident_key}`} className="font-medium text-focus hover:underline">
+                        {row.incident_key}
+                      </Link>
                     </td>
                     <td className="max-w-xs truncate px-3 py-2 text-heading">{row.subject ?? "—"}</td>
                     <td className="px-3 py-2">

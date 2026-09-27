@@ -6,17 +6,17 @@ load_dotenv()
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql+psycopg://npe:npe@localhost:5432/npe_triage",
+    "postgresql+psycopg://npe:npe@localhost:5433/npe_triage_rca",
 )
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-OPA_URL = os.environ.get("OPA_URL", "http://localhost:8181")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
+OPA_URL = os.environ.get("OPA_URL", "http://localhost:8182")
 
 IDEMPOTENCY_TTL_SECONDS = int(os.environ.get("IDEMPOTENCY_TTL_SECONDS", str(24 * 60 * 60)))
 
 # RabbitMQ carries a single queue, incidents.raw (plus its dead-letter
 # queue). On-demand re-diagnosis goes through POST /incidents/{jira_key}/retry,
 # which is DB-backed and needs no broker.
-RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5673/")
 
 # Microsoft Graph (Teams) + Jira Cloud. These default to empty strings,
 # which is fine for mocked tests but will fail acquire_token()/API calls

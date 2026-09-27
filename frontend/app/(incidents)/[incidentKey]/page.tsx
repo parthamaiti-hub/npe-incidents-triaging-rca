@@ -6,7 +6,7 @@ import { useParams } from "next/navigation";
 import { ExecutionView } from "@/components/ExecutionView";
 import { FeedbackForm } from "@/components/FeedbackForm";
 import { classificationBadgeClass, classificationMethodAnnotation, classificationStatusLabel } from "@/lib/classification";
-import { useIncidentByJiraKey } from "@/lib/queries/incidents";
+import { useIncidentByKey } from "@/lib/queries/incidents";
 import { useExecution } from "@/lib/queries/workflows";
 
 // Tab 1 detail: incident + its latest RCA attempt's
@@ -15,8 +15,8 @@ import { useExecution } from "@/lib/queries/workflows";
 // -- never POST /rca/{jira_key}, which always does a live Jira refetch and
 // would silently re-trigger classification on every page load.
 export default function IncidentDetailPage() {
-  const { jiraKey } = useParams<{ jiraKey: string }>();
-  const { data: incident, isLoading: loadingIncident, isError: incidentQueryError } = useIncidentByJiraKey(jiraKey);
+  const { incidentKey } = useParams<{ incidentKey: string }>();
+  const { data: incident, isLoading: loadingIncident, isError: incidentQueryError } = useIncidentByKey(incidentKey);
   const { data: execution, isLoading: loadingExecution } = useExecution(incident?.latest_execution_id ?? undefined);
 
   if (loadingIncident) {
@@ -30,7 +30,7 @@ export default function IncidentDetailPage() {
   if (incidentQueryError) {
     return (
       <main className="p-6">
-        <p className="text-sm text-danger">Failed to load incident {jiraKey}.</p>
+        <p className="text-sm text-danger">Failed to load incident {incidentKey}.</p>
       </main>
     );
   }
@@ -38,7 +38,7 @@ export default function IncidentDetailPage() {
   if (!incident) {
     return (
       <main className="p-6">
-        <p className="text-sm text-muted">No ingested incident found for {jiraKey}.</p>
+        <p className="text-sm text-muted">No ingested incident found for {incidentKey}.</p>
       </main>
     );
   }
@@ -48,7 +48,7 @@ export default function IncidentDetailPage() {
       <Link href="/" className="text-sm text-focus hover:underline">
         &larr; back to dashboard
       </Link>
-      <h1 className="mt-2 text-xl font-semibold text-heading">{incident.jira_key}</h1>
+      <h1 className="mt-2 text-xl font-semibold text-heading">{incident.incident_key}</h1>
       <p className="text-sm text-muted">{incident.subject}</p>
 
       <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
@@ -63,8 +63,9 @@ export default function IncidentDetailPage() {
         <span className="text-muted">
           {incident.source_system_id ?? "—"} / {incident.category ?? "—"}
         </span>
+        {incident.jira_key && incident.jira_key !== incident.incident_key && <span className="text-muted">Jira: {incident.jira_key}</span>}
         {incident.status && <span className="text-muted">Jira status: {incident.status}</span>}
-        <Link href={`/retry?q=${incident.jira_key}`} className="text-focus hover:underline">
+        <Link href={`/retry?q=${incident.incident_key}`} className="text-focus hover:underline">
           Retry RCA
         </Link>
       </div>

@@ -1,8 +1,11 @@
-"""RabbitMQ consumer worker: classifies each raw incident event and writes
-the result back onto its Incident row.
+"""RabbitMQ consumer worker: classifies each raw incident event, writes the
+result back onto its Incident row, then runs the incident's first RCA
+automatically (the active playbook, or a recorded 'no playbook' / 'not
+classified' outcome). Later RCAs are operator retries.
 
 Each message is retried with backoff; once attempts are exhausted it is
-nack'ed to the dead-letter queue via RabbitMQ's native ack/nack.
+nack'ed to the dead-letter queue via RabbitMQ's native ack/nack. The
+automatic RCA is best-effort: its failure never fails the message.
 
 Correlation is not done here: it runs synchronously, inline in
 app.workflow_orchestrator, with no broker dependency.
@@ -19,13 +22,14 @@ from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.classification import FULLY_CLASSIFIED_STATUSES, classify_raw_text
+from app.classification import FULLY_CLASSIFIED_STATUSES, apply_classification, classify_raw_text
 from app.config import LLM_FALLBACK_ENABLED
 from app.db import make_async_engine, make_async_session_factory
 from app.embeddings import embed_resolved_incident
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
 from app.llm_client import make_openai_client
-from app.models import ClassificationEmbedding, Incident
+from app.models import ClassificationEmbedding, Incident, WorkflowExecution
+from app.workflow_orchestrator import run_rca_for_incident
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +58,7 @@ async def process_message(
             raise IncidentNotFoundError(payload["incident_id"])
 
         result = await classify_raw_text(session, payload["raw_text"], client=openai_client)
-
-        incident.classification_status = result["status"]
-        incident.matched_rule_id = result["matched_rule_id"]
-        incident.source_system_id = result["source_system_id"]
-        incident.category = result["category"]
-        incident.classification_method = result["classification_method"]
-        incident.llm_confidence = result["llm_confidence"]
+        apply_classification(incident, result)
 
         # Classification commits on its own here -- embedding no
         # longer shares this transaction (see _embed_incident_best_effort
@@ -75,6 +73,31 @@ async def process_message(
 
     if LLM_FALLBACK_ENABLED and status in FULLY_CLASSIFIED_STATUSES:
         await _embed_incident_best_effort(session_factory, openai_client, incident_id)
+
+    await _auto_rca_best_effort(session_factory, incident_id)
+
+
+async def _auto_rca_best_effort(session_factory: async_sessionmaker, incident_id: str) -> None:
+    """The incident's first RCA, right after classification. Runs in its own
+    transaction after classification has committed; a failure is logged and
+    swallowed (the execution row records it), never re-raised into
+    process_with_retry. Skipped if an automatic RCA already exists for this
+    incident, so a redelivered message doesn't run it twice."""
+    try:
+        async with session_factory() as session:
+            already = await session.scalar(
+                select(WorkflowExecution.id).where(
+                    WorkflowExecution.incident_id == incident_id, WorkflowExecution.triggered_by == "auto"
+                )
+            )
+            if already is not None:
+                return
+            incident = await session.get(Incident, incident_id)
+            if incident is None:
+                return
+            await run_rca_for_incident(session, incident, triggered_by="auto")
+    except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+        logger.warning("Automatic RCA failed for incident %s: %s", incident_id, exc)
 
 
 async def _embed_incident_best_effort(

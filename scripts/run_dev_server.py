@@ -16,4 +16,4 @@ import uvicorn
 
 if __name__ == "__main__":
     loop = asyncio.SelectorEventLoop if sys.platform == "win32" else "auto"
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8420, reload=False, loop=loop)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8421, reload=False, loop=loop)

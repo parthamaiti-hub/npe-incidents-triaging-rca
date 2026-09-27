@@ -6,7 +6,7 @@ Jira/ServiceNow tickets. For each incident the service:
 1. **Ingests** it (webhooks, or a Teams channel poller that follows Jira-key mentions).
 2. **Classifies** it against a source-system catalog — deterministic OPA rules first, optional LLM fallback.
 3. **Correlates** it with other incidents on the same application within a rolling 24-hour window.
-4. **Executes** the approved diagnostic playbook for its `(source_system, category)`.
+4. **Executes** the approved diagnostic playbook for its `(source_system, category)` — automatically, right after classification.
 5. **Synthesizes** a root-cause assessment with recommended actions.
 6. **Reports** back — optionally as a Jira comment — and exposes everything in an operator UI for feedback and retries.
 
@@ -19,34 +19,39 @@ deployed in 6 non-prod environments.
 
 ```
 Teams / Jira / ServiceNow webhooks ─┐
-Teams channel poller (Graph + Jira) ┴─► idempotency (Valkey) ─► RabbitMQ `incidents.raw` ─► classification worker
-                                                                                              │
-          signal extraction + OPA policy (opa/policies/mapping.rego) vs INCIDENT_MAPPING_RULE ◄┘
-                                                                                              │
-                              classified `incident` row ─► correlation (Postgres, 24h window per application)
-                                                                                              │
-                active approved playbook for (source_system, category) ─► playbook engine ─► evidence
-                                                                                              │
-                                   RCA synthesis (deterministic, or LLM/RAG via Redis Stream + rca_worker)
+Teams channel poller (Graph + Jira) ┴─► idempotency (Valkey) ─► `incident` row + incident ID ─► RabbitMQ `incidents.raw`
+                                                                                                      │
+          classification worker: signal extraction + OPA policy (opa/policies/mapping.rego) ◄─────────┘
+                                 vs INCIDENT_MAPPING_RULE (optional LLM fallback)
+                                                          │
+                                   automatic first RCA ◄──┘      Retry tab / POST /incidents/{incident_key}/retry
+                                            │                    (re-classify with current rules) ──┐
+                                            ▼                                                       │
+     active approved playbook for (source_system, category) ◄────────────────────────────────────────┘
+       ─► playbook engine ─► evidence ─► correlation (Postgres, 24h window per application)
+       ─► RCA synthesis (deterministic, or LLM/RAG via Redis Stream + rca_worker) ─► execution record
 ```
 
 | Component | Module | Role |
 |---|---|---|
-| API | `app/main.py`, `app/routers/*`, `app/webhooks.py` | FastAPI on `:8420`: webhooks, catalog/function/workflow/incident APIs, `/health` |
-| Classification worker | `app/worker.py`, `app/classification.py` | Consumes `incidents.raw` (with dead-letter queue), classifies via OPA |
+| API | `app/main.py`, `app/routers/*`, `app/webhooks.py` | FastAPI on `:8421`: webhooks, catalog/function/workflow/incident APIs, `/health` |
+| Classification worker | `app/worker.py`, `app/classification.py` | Consumes `incidents.raw` (with dead-letter queue), classifies via OPA, then runs the incident's first RCA |
 | Poller | `app/poller.py` | Polls Teams via Microsoft Graph for Jira keys, fetches issues from Jira Cloud |
 | Sweeper | `app/sweeper.py` | Re-publishes incidents stuck in `pending` (crash between DB commit and publish) |
 | RCA worker | `app/rca_worker.py` | Consumes `stream:rca-pending` for LLM-based RCA synthesis; idles when that feature is off |
 | Playbook engine | `app/workflow_orchestrator.py`, `app/playbook_engine.py` | Builds, versions, approves and executes playbooks |
-| Operator UI | `frontend/` | Next.js app on `:3000` |
+| Operator UI | `frontend/` | Next.js app on `:3001` |
 
-Infrastructure (via `docker-compose.yml`): Postgres 17 with pgvector, Valkey (Redis), RabbitMQ, OPA.
+Infrastructure (via `docker-compose.yml`): Postgres 17 with pgvector (database `npe_triage_rca`), Valkey (Redis), RabbitMQ, OPA.
+Host ports are offset so this stack can run alongside another on the defaults: Postgres `5433`, Valkey `6380`,
+RabbitMQ `5673` (management `15673`), OPA `8182`, API `8421`, UI `3001`.
 
 ---
 
 ## Getting started (Windows)
 
-Prerequisites: Docker, [uv](https://docs.astral.sh/uv/) (Python ≥ 3.12). Node 22 + pnpm only if you develop the frontend locally.
+Prerequisites: Docker, [uv](https://docs.astral.sh/uv/) (Python ≥ 3.12). Node 22 + pnpm only if you develop the
+frontend locally or run its end-to-end tests (`corepack enable`, or prefix commands with `npx pnpm@10`).
 
 ```
 uv sync
@@ -56,7 +61,11 @@ copy .env.example .env         # then fill in real values (see Configuration)
 ```
 
 `start.ps1` waits for Postgres to be healthy, loads/seeds the catalogs, starts each process in the background, then
-polls `/health`. PIDs and logs live under `.run\` (gitignored). Each process is skipped if it's already running.
+polls `/health`. PIDs and logs live under `.run\` (gitignored). Each process is skipped if it's already running, so
+after changing backend code run `stop.ps1 -KeepDockerRunning` then `start.ps1 -SkipCatalogLoad` to pick it up.
+
+`docker compose up -d` builds the UI image only the first time; after frontend changes rebuild it with
+`docker compose up -d --build frontend`.
 
 | Flag | Effect |
 |---|---|
@@ -68,12 +77,12 @@ polls `/health`. PIDs and logs live under `.run\` (gitignored). Each process is 
 Check the stack is really up:
 
 ```
-curl http://localhost:8420/health     # exercises database, Redis and RabbitMQ; 503 if any is down
+curl http://localhost:8421/health     # exercises database, Redis and RabbitMQ; 503 if any is down
 ```
 
-- API docs: http://localhost:8420/docs
-- Operator UI: http://localhost:3000
-- RabbitMQ management: http://localhost:15672 (guest/guest)
+- API docs: http://localhost:8421/docs
+- Operator UI: http://localhost:3001
+- RabbitMQ management: http://localhost:15673 (guest/guest)
 
 ### Running pieces manually
 
@@ -85,7 +94,7 @@ uv run python -m dataloadscripts.load_function_registry
 uv run python -m dataloadscripts.seed_functional_dummy_versions
 uv run python -m dataloadscripts.seed_rca_pattern_types
 
-uv run python -m scripts.run_dev_server   # API on :8420
+uv run python -m scripts.run_dev_server   # API on :8421
 uv run python -m app.worker               # classification worker
 uv run python -m app.poller               # Teams -> Jira poller
 uv run python -m app.rca_worker           # LLM RCA synthesis worker
@@ -94,21 +103,22 @@ uv run python -m app.sweeper              # stuck-incident sweeper
 
 All loaders are idempotent (rows are upserted by primary key).
 
-Post a test incident:
+Post a test incident (PowerShell). The worker classifies it and runs its first RCA; it appears on the dashboard
+under a generated `int_...` ID:
 
-```
-curl -X POST http://localhost:8420/webhooks/teams -H "Content-Type: application/json" \
-  -d '{"id": "msg-1", "text": "Subject: ...\nEnvironment: NPE\n..."}'
+```powershell
+$body = @{ id = "msg-1"; text = "Subject: Billing UAT failing`nEnvironment: NPE`nImpact: ..." } | ConvertTo-Json
+Invoke-RestMethod -Method Post http://localhost:8421/webhooks/teams -ContentType "application/json" -Body $body
 ```
 
 ### Frontend development
 
-`docker compose up -d` builds and serves the UI on `:3000`. For hot reload instead:
+The Docker container serves the UI on `:3001`. For hot reload instead:
 
 ```
 cd frontend
 pnpm install
-pnpm dev                 # proxies /api/backend/* to BACKEND_URL (default http://localhost:8420)
+pnpm dev --port 3002     # Next's default :3000 may be taken; proxies /api/backend/* to BACKEND_URL (default http://localhost:8421)
 pnpm gen:api             # regenerate lib/types.ts from the running API's OpenAPI schema
 ```
 
@@ -144,8 +154,8 @@ The poller needs both Jira and Graph credentials; the Jira client alone works wi
 | Tab | What it does |
 |---|---|
 | **RCA of Incidents** | Dashboard of incidents with classification and RCA status; drill into an incident and each execution's evidence graph, give feedback |
-| **Playbooks for RCA** | Browse playbook definitions and versions as a CNCF workflow graph, view each step's function source; create a new playbook |
-| **Retry RCA** | Re-run a diagnosis, optionally with operator context or a different playbook version |
+| **Playbooks for RCA** | Browse playbook definitions and versions as a CNCF workflow graph, view each step's function source; create a new playbook, or edit the approved one with the graph and its CNCF YAML side by side |
+| **Retry RCA** | Reprocess an incident by its ID: re-classify with the current mapping rules, then run the active playbook (or a chosen version), optionally with operator context |
 | **System Mapping Data** | CRUD for source systems and their footprints (what classification matches against) |
 | **Check Type Registry** | Browse check functions, their parameter contracts and version history |
 
@@ -190,6 +200,21 @@ feedback. Don't expose the stack beyond localhost or a trusted network.
 systems have one; others report "no playbook configured" rather than a fabricated RCA. The engine is
 category-agnostic — enabling a new category is catalog data, not code.
 
+### Incident IDs and reprocessing
+
+Every incident has an **incident ID** (`incident_key`), used by the dashboard, detail page, Retry tab and execution
+history:
+
+- An incident that arrives with a Jira key is known by that key (e.g. `RS-173234`).
+- Any other incident (e.g. pushed by the Teams or ServiceNow webhook) gets a generated ID
+  `int_MMDDYYYYHHMMSS_NNNNN`: the ingest time in UTC plus a running number from a database sequence, `00001`–`99999`,
+  then wrapping. Example: `int_09272026192617_00001`. The source's own identifier stays in `external_id`.
+
+Each incident gets its first RCA automatically after classification — the active playbook, or a recorded
+*no playbook* / *not classified* outcome. After fixing a mapping rule or a playbook, **Retry** the incident by its ID:
+retry re-classifies the stored text with the current rules, then runs the now-active playbook. Every attempt is kept
+as its own execution (`triggered_by` = `auto`, `rca`, `retry`).
+
 ### Two statuses, never conflated
 
 - **RCA status** (`app/rca_status.py`) — diagnostic confidence: `Identified`, `Probable`, `Inconclusive`,
@@ -204,7 +229,7 @@ Neither ever says "resolved".
 ## CLI scripts
 
 ```
-uv run python -m scripts.e2e_rca TT-1                   # fetch Jira issue, classify, run playbook, print RCA
+uv run python -m scripts.e2e_rca TT-1                   # fetch Jira issue, record/refresh the incident, classify, run playbook, print RCA
 uv run python -m scripts.e2e_rca TT-1 --post-comment    # ...and post the RCA to the Jira issue
 
 uv run python -m scripts.build_workflow --source-system SYS_HSI \
@@ -221,7 +246,7 @@ is Atlassian Document Format with panels color-coded by RCA status (`app/adf_rep
 
 ## REST API
 
-Served on `:8420`; interactive docs at `/docs`. No authentication.
+Served on `:8421`; interactive docs at `/docs`. No authentication.
 
 | Area | Endpoints |
 |---|---|
@@ -232,8 +257,8 @@ Served on `:8420`; interactive docs at `/docs`. No authentication.
 | Playbook builds | `POST/GET /workflows/build-requests`, `GET /workflows/build-requests/{id}`, `POST .../{id}/approve`, `POST .../{id}/reject` |
 | Playbook definitions | `GET /workflows/definitions`, `GET /workflows/definitions/{id}/versions`, `GET /workflows/active?source_system_id=&category=`, `POST /workflows/versions/{id}/execute` |
 | Playbook editing | `GET /workflows/versions/{id}/yaml`, `POST /workflows/render-yaml`, `POST /workflows/validate-yaml` (dry run), `POST /workflows/definitions/{id}/edits`. Validation errors are `422` with `{kind: syntax\|schema\|registry, errors: [{message, path, line, column, task_index}]}` |
-| Executions & feedback | `GET /workflows/executions[?jira_key=]`, `GET /workflows/executions/{id}`, `GET/POST /workflows/executions/{id}/feedback`, `GET /workflows/rca-patterns` |
-| Incidents | `GET /incidents`, `GET /incidents/dashboard`, `GET /incidents/{id}`, `POST /incidents/{jira_key}/retry`, `POST /rca/{jira_key}[?post_comment=true]` |
+| Executions & feedback | `GET /workflows/executions[?incident_key=&jira_key=]`, `GET /workflows/executions/{id}`, `GET/POST /workflows/executions/{id}/feedback`, `GET /workflows/rca-patterns` |
+| Incidents | `GET /incidents`, `GET /incidents/dashboard`, `GET /incidents/{id}`, `POST /incidents/{incident_key}/retry` (re-classifies, then runs), `POST /rca/{jira_key}[?post_comment=true]` (404 if Jira has no such ticket) |
 | Stats | `GET /stats/incidents` |
 
 ---
@@ -248,13 +273,20 @@ uv run pytest tests/test_checks.py::test_x      # one test
 
 Tests start ephemeral Postgres, Valkey, RabbitMQ and OPA containers with testcontainers, so **Docker must be
 running**. Poller/Graph/Jira logic is covered by mocked tests using real sample-ticket fixtures.
+`tests/test_JIRA_Token.py` is a manual live-Jira connectivity check with a placeholder site; exclude it from routine
+runs with `--deselect tests/test_JIRA_Token.py::test_read_jira_ticket`.
 
-Frontend end-to-end tests run against a real running stack:
+Frontend end-to-end tests (Playwright) run against the real running stack — `start.ps1` plus the UI on `:3001`
+(override with `E2E_BASE_URL`):
 
 ```
 cd frontend
+pnpm exec playwright install chromium   # first time only
 pnpm e2e
 ```
+
+The dashboard and retry tests fetch the real ticket `TT-1` from Jira, and with `RCA_SYNTHESIS_LLM_ENABLED=true` each
+playbook run makes an OpenAI call.
 
 ---
 
@@ -276,6 +308,6 @@ app/check_types/    v2 check implementations (one module per check type)
 dataloadscripts/    catalog YAML (source systems, mapping rules, playbooks) and the loaders/seeders that load it
 scripts/            start/stop, dev server, CLI tools
 opa/policies/       OPA classification policy
-frontend/           Next.js operator UI
+frontend/           Next.js operator UI (frontend/e2e/: Playwright tests)
 tests/              pytest suite
 ```

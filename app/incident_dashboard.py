@@ -53,7 +53,9 @@ async def load_incidents_with_latest_execution(
         stmt = stmt.where(Incident.received_at <= date_to)
     if q:
         pattern = f"%{q}%"
-        stmt = stmt.where(or_(Incident.jira_key.ilike(pattern), Incident.subject.ilike(pattern)))
+        stmt = stmt.where(
+            or_(Incident.incident_key.ilike(pattern), Incident.jira_key.ilike(pattern), Incident.subject.ilike(pattern))
+        )
 
     incidents = (await session.scalars(stmt)).all()
     if not incidents:

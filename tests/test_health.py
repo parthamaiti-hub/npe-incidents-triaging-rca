@@ -33,7 +33,7 @@ def test_health_reports_unhealthy_when_database_is_unreachable(redis_url, rabbit
     app = create_app(
         # nothing listens on port 1; connect_timeout keeps this test fast
         # instead of waiting on the OS's full TCP connect timeout.
-        database_url="postgresql+psycopg://npe:npe@localhost:1/npe_triage?connect_timeout=2",
+        database_url="postgresql+psycopg://npe:npe@localhost:1/npe_triage_rca?connect_timeout=2",
         redis_url=redis_url,
         rabbitmq_url=rabbitmq_url,
     )

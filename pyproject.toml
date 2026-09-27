@@ -1,5 +1,5 @@
 [project]
-name = "npe-incidents-triaging"
+name = "npe-incidents-triaging-rca"
 version = "0.1.0"
 description = "Automated RCA triage for non-production environment incidents"
 requires-python = ">=3.12"

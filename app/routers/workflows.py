@@ -80,6 +80,7 @@ class WorkflowExecutionOut(BaseModel):
     id: str
     jira_key: str | None
     incident_id: str | None
+    incident_key: str | None = None
     workflow_definition_version_id: str | None
     document_snapshot: list[dict]
     evidence: list[dict] | None
@@ -407,10 +408,18 @@ async def list_rca_patterns(session: AsyncSession = Depends(get_async_session)):
 
 
 @router.get("/executions", response_model=list[WorkflowExecutionOut])
-async def list_executions(jira_key: str | None = None, session: AsyncSession = Depends(get_async_session)):
+async def list_executions(
+    jira_key: str | None = None,
+    incident_key: str | None = None,
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Newest first. incident_key is the usual filter (every incident has
+    one); jira_key still works for Jira-sourced runs."""
     stmt = select(WorkflowExecution).order_by(WorkflowExecution.started_at.desc())
     if jira_key is not None:
         stmt = stmt.where(WorkflowExecution.jira_key == jira_key)
+    if incident_key is not None:
+        stmt = stmt.where(WorkflowExecution.incident_key == incident_key)
     rows = (await session.scalars(stmt)).all()
     return [WorkflowExecutionOut.model_validate(r, from_attributes=True) for r in rows]
 

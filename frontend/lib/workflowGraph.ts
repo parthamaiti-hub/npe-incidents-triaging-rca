@@ -10,6 +10,8 @@ export type GraphNodeStatus = "OK" | "WARN" | "ERROR";
 
 export interface GraphTask {
   id: string;
+  /** Position in the task list (the document is a plain ordered list). */
+  index: number;
   label: string;
   call: string;
   functionVersionNumber: number | null;
@@ -56,6 +58,7 @@ export function toGraphTasks(document: unknown[], evidence?: unknown[] | null): 
     const rawEvidence = evidence?.[i] as RawEvidence | undefined;
     return {
       id: `task-${i}`,
+      index: i,
       label: task.name ?? task.call,
       call: task.call,
       functionVersionNumber: task.function_version_number ?? null,

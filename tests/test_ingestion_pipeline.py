@@ -1,14 +1,16 @@
 import asyncio
+import re
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.db import Base, make_async_engine, make_async_session_factory, make_engine, make_session_factory
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
 from app.idempotency import make_dedup_key, make_redis
 from app.incident_parser import parse_template
 from app.main import create_app
-from app.models import Incident
+from app.models import Incident, WorkflowExecution
 from app.worker import process_message
 from dataloadscripts.test_fixtures import (
     DUPLICATE_TEST_TEXT,
@@ -71,6 +73,22 @@ def _get_incident(loaded_catalog_db, incident_id: str) -> Incident:
         return session.get(Incident, incident_id)
 
 
+def _executions(loaded_catalog_db, incident_id: str) -> list[WorkflowExecution]:
+    engine = make_engine(loaded_catalog_db)
+    with make_session_factory(engine)() as session:
+        rows = session.scalars(select(WorkflowExecution).where(WorkflowExecution.incident_id == incident_id)).all()
+    engine.dispose()
+    return list(rows)
+
+
+async def _process_again(loaded_catalog_db, payload: dict) -> None:
+    engine = make_async_engine(loaded_catalog_db)
+    try:
+        await process_message(make_async_session_factory(engine), payload)
+    finally:
+        await engine.dispose()
+
+
 def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbitmq_url):
     with TestClient(app) as client:
         response = client.post("/webhooks/teams", json={"id": "msg-1", "text": WORKED_TRACE_TEXT})
@@ -93,6 +111,18 @@ def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbi
     assert incident.category == "DATA QUALITY / TEST DATA"
     assert incident.jira_key is None  # Teams source, no confirmed Jira ticket at ingest time
     assert incident.matched_rule_id == "IMR_DCD_TABLE_DATA"
+    assert re.match(r"^int_\d{14}_\d{5}$", incident.incident_key)  # generated, no Jira key
+
+    # The worker ran the first RCA automatically: SYS_DCD has a playbook.
+    (execution,) = _executions(loaded_catalog_db, incident_id)
+    assert execution.triggered_by == "auto"
+    assert execution.incident_key == incident.incident_key
+    assert execution.workflow_definition_version_id is not None
+    assert execution.status == "completed"
+
+    # A redelivered message re-classifies but doesn't run a second automatic RCA.
+    asyncio.run(_process_again(loaded_catalog_db, message))
+    assert len(_executions(loaded_catalog_db, incident_id)) == 1
 
 
 def test_duplicate_incident_is_deduped(app, loaded_catalog_db, rabbitmq_url):
@@ -127,6 +157,12 @@ def test_no_footprint_incident_routes_to_manual_triage(app, loaded_catalog_db, r
     assert incident.classification_status == "manual_triage"
     assert incident.source_system_id is None
     assert incident.category is None
+
+    # Nothing to run, but the automatic RCA attempt is still recorded.
+    (execution,) = _executions(loaded_catalog_db, incident_id)
+    assert execution.triggered_by == "auto"
+    assert execution.workflow_definition_version_id is None
+    assert execution.rca["matched_pattern"] == "not_classified"
 
 
 def test_jira_webhook_ingests_and_classifies(app, loaded_catalog_db, rabbitmq_url):

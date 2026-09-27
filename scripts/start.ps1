@@ -103,7 +103,7 @@ $healthy = $false
 $deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -le $deadline) {
     try {
-        $health = Invoke-RestMethod -Uri "http://localhost:8420/health" -TimeoutSec 3
+        $health = Invoke-RestMethod -Uri "http://localhost:8421/health" -TimeoutSec 3
         Write-Host ($health | ConvertTo-Json -Depth 5)
         $healthy = ($health.status -eq "ok")
         break
@@ -112,9 +112,9 @@ while ((Get-Date) -le $deadline) {
     }
 }
 if (-not $healthy) {
-    Write-Warning "API not healthy yet at http://localhost:8420/health -- check .run\logs\api.log / api.err.log"
+    Write-Warning "API not healthy yet at http://localhost:8421/health -- check .run\logs\api.log / api.err.log"
 }
 
 Write-Host ""
-Write-Host "Stack is up. API docs: http://localhost:8420/docs"
+Write-Host "Stack is up. API docs: http://localhost:8421/docs"
 Write-Host "Stop with: .\scripts\stop.ps1"

@@ -15,7 +15,7 @@ import type { NextRequest } from "next/server";
 // reads process.env.BACKEND_URL at the time each request actually arrives
 // -- the pattern Next.js's own "Proxying to a backend" guide recommends.
 function backendUrl(): string {
-  return process.env.BACKEND_URL ?? "http://localhost:8420";
+  return process.env.BACKEND_URL ?? "http://localhost:8421";
 }
 
 async function proxy(request: NextRequest, path: string[]) {

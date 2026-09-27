@@ -7,29 +7,27 @@ terminal.
 
 import datetime
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.classification import apply_classification, classify_raw_text
 from app.config import JIRA_SITE
 from app.db import get_async_session
 from app.e2e_pipeline import run_e2e_for_jira_key
 from app.incident_dashboard import load_incidents_with_latest_execution
 from app.models import Incident
 from app.routers.workflows import WorkflowExecutionOut
-from app.workflow_orchestrator import (
-    WorkflowValidationError,
-    execute_and_record,
-    get_active_workflow,
-    get_version_for_retry,
-)
+from app.workflow_orchestrator import WorkflowValidationError, get_version_for_retry, run_rca_for_incident
 
 router = APIRouter(tags=["incidents"])
 
 
 class IncidentOut(BaseModel):
     id: str
+    incident_key: str
     source: str
     external_id: str
     subject: str | None
@@ -56,6 +54,7 @@ class IncidentOut(BaseModel):
 
 class RcaResultOut(BaseModel):
     jira_key: str
+    incident_key: str
     summary: str
     status: str
     priority: str
@@ -176,33 +175,42 @@ async def trigger_rca(
     """Fetches jira_key fresh from Jira Cloud, classifies it, executes its
     active workflow (if any), and returns the synthesized RCA -- the API
     equivalent of `uv run python -m scripts.e2e_rca <jira_key>`. Requires
-    JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN to be configured."""
-    result = await run_e2e_for_jira_key(
-        session, request.app.state.http_client, jira_key, jira_site=JIRA_SITE, post_rca_comment=post_comment
-    )
+    JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN to be configured. A ticket Jira
+    doesn't have is a 404; any other Jira failure is a 502."""
+    try:
+        result = await run_e2e_for_jira_key(
+            session, request.app.state.http_client, jira_key, jira_site=JIRA_SITE, post_rca_comment=post_comment
+        )
+    except httpx.HTTPStatusError as exc:
+        await session.rollback()
+        if exc.response.status_code == 404:
+            raise HTTPException(404, f"Jira issue {jira_key!r} not found") from exc
+        raise HTTPException(502, f"Jira request failed ({exc.response.status_code}) for {jira_key!r}") from exc
     await session.commit()
     return result
 
 
-@router.post("/incidents/{jira_key}/retry", response_model=WorkflowExecutionOut)
+@router.post("/incidents/{incident_key}/retry", response_model=WorkflowExecutionOut)
 async def retry_incident(
-    jira_key: str,
+    incident_key: str,
     payload: RetryRequestIn,
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Re-runs RCA against an already-ingested incident (no fresh Jira
-    fetch, unlike POST /rca/{jira_key} -- retry is for re-diagnosing known
-    incidents, not re-fetching them) -- either the currently-active
-    workflow, or an explicit version override (any approved-or-superseded
-    version). Every retry is its own WorkflowExecution
-    row, so retry history is just
-    GET /workflows/executions?jira_key=."""
-    incident = (await session.scalars(select(Incident).where(Incident.jira_key == jira_key))).first()
+    """Reprocesses an already-ingested incident, found by its incident_key
+    (its Jira key, or its generated int_... key). No fresh Jira fetch --
+    that's POST /rca/{jira_key}.
+
+    The stored incident text is re-classified against the current mapping
+    rules first, so a fixed rule takes effect; then the now-active playbook
+    runs, or the explicit version override (any approved-or-superseded
+    version). When there's nothing to run (no playbook / not classified)
+    that outcome is recorded rather than rejected. Every retry is its own
+    WorkflowExecution row: history is GET /workflows/executions?incident_key=."""
+    incident = (await session.scalars(select(Incident).where(Incident.incident_key == incident_key))).first()
     if incident is None:
-        raise HTTPException(404, f"No ingested Incident for jira_key {jira_key!r}")
+        raise HTTPException(404, f"No ingested incident with key {incident_key!r}")
 
-    active_version = await get_active_workflow(session, incident.source_system_id, incident.category)
-
+    version = None
     if payload.workflow_definition_version_id is not None:
         try:
             version = await get_version_for_retry(session, payload.workflow_definition_version_id)
@@ -210,22 +218,16 @@ async def retry_incident(
             raise HTTPException(422, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
-        mapping_overridden = active_version is None or version.id != active_version.id
-    else:
-        if active_version is None:
-            raise HTTPException(
-                422, f"No active workflow for ({incident.source_system_id}, {incident.category})"
-            )
-        version = active_version
-        mapping_overridden = False
 
-    execution = await execute_and_record(
+    classification = await classify_raw_text(session, incident.raw_text)
+    apply_classification(incident, classification)
+    await session.flush()
+
+    execution = await run_rca_for_incident(
         session,
-        version,
-        jira_key=jira_key,
-        incident_id=incident.id,
+        incident,
         triggered_by="retry",
-        mapping_overridden=mapping_overridden,
+        version=version,
         requested_by=payload.requested_by,
         operator_context=payload.operator_context,
     )

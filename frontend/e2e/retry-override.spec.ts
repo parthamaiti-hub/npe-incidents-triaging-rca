@@ -1,6 +1,6 @@
 import { expect, test } from "./fixtures";
 
-const BACKEND_URL = process.env.BACKEND_URL_FOR_TESTS ?? "http://localhost:8420";
+const BACKEND_URL = process.env.BACKEND_URL_FOR_TESTS ?? "http://localhost:8421";
 
 // Happy path: retry with an edited mapping. Seeds via
 // the real backend rather than assuming leftover manual-testing state:

@@ -26,29 +26,29 @@ export function useIncidentsDashboard(filters: DashboardFilters) {
 }
 
 /**
- * There's no `GET /incidents/by-jira-key/{key}` route -- the dashboard
- * endpoint's `q` filter already ILIKE-matches jira_key, so this reuses it
- * as a lookup-by-key and picks the exact match client-side (q also
- * substring-matches `subject`, so an exact-key check is still needed).
- * Returns `null` (not an error) when no incident with this jira_key has
- * been ingested yet -- distinct from a real fetch failure.
+ * Looks an incident up by its incident_key -- its Jira key, or the
+ * generated int_... key for incidents that arrived without one. Reuses the
+ * dashboard's `q` filter (which ILIKE-matches incident_key) and picks the
+ * exact match client-side, since `q` also substring-matches `subject`.
+ * Returns `null` (not an error) when no such incident exists -- distinct
+ * from a real fetch failure.
  */
-export function useIncidentByJiraKey(jiraKey: string | undefined) {
+export function useIncidentByKey(incidentKey: string | undefined) {
   return useQuery({
-    queryKey: ["incidents", "by-jira-key", jiraKey],
+    queryKey: ["incidents", "by-key", incidentKey],
     queryFn: async () => {
       const { data, error } = await api.GET("/incidents/dashboard", {
-        params: { query: { q: jiraKey, limit: 5 } },
+        params: { query: { q: incidentKey, limit: 5 } },
       });
       if (error) throw error;
-      return data.items.find((item) => item.jira_key === jiraKey) ?? null;
+      return data.items.find((item) => item.incident_key === incidentKey) ?? null;
     },
-    enabled: !!jiraKey,
+    enabled: !!incidentKey,
   });
 }
 
 export interface RetryInput {
-  jiraKey: string;
+  incidentKey: string;
   workflowDefinitionVersionId?: string;
   requestedBy: string;
   /** Optional operator-supplied hint for RCA synthesis --
@@ -57,17 +57,18 @@ export interface RetryInput {
   operatorContext?: string;
 }
 
-/** POST /incidents/{jira_key}/retry -- re-runs RCA against an already-
- * ingested incident (no live Jira refetch, unlike POST /rca/{jira_key}).
- * Throws the backend's error message on 404 (never ingested) / 422
- * (no active workflow, or an unretriable version), surfaced inline by the
- * retry page rather than a toast. */
+/** POST /incidents/{incident_key}/retry -- reprocesses an already-ingested
+ * incident: re-classifies its stored text with the current mapping rules,
+ * then runs the active playbook (or the chosen version); 'no playbook' /
+ * 'not classified' outcomes are recorded, not rejected. Throws the
+ * backend's message on 404 (unknown key) / 422 (unretriable version),
+ * surfaced inline by the retry page rather than a toast. */
 export function useRetryIncident() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ jiraKey, workflowDefinitionVersionId, requestedBy, operatorContext }: RetryInput) => {
-      const { data, error, response } = await api.POST("/incidents/{jira_key}/retry", {
-        params: { path: { jira_key: jiraKey } },
+    mutationFn: async ({ incidentKey, workflowDefinitionVersionId, requestedBy, operatorContext }: RetryInput) => {
+      const { data, error, response } = await api.POST("/incidents/{incident_key}/retry", {
+        params: { path: { incident_key: incidentKey } },
         body: {
           workflow_definition_version_id: workflowDefinitionVersionId,
           requested_by: requestedBy,
@@ -81,8 +82,9 @@ export function useRetryIncident() {
       return data;
     },
     onSuccess: (_data, variables) => {
-      queryClient.invalidateQueries({ queryKey: ["executions", "by-jira-key", variables.jiraKey] });
-      queryClient.invalidateQueries({ queryKey: ["incidents", "dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["executions", "by-incident-key", variables.incidentKey] });
+      // Retry re-classifies, so the incident's own fields may have changed too.
+      queryClient.invalidateQueries({ queryKey: ["incidents"] });
     },
   });
 }

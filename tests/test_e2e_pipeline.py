@@ -1,11 +1,16 @@
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import respx
+from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.db import Base, make_async_engine, make_async_session_factory
 from app.e2e_pipeline import run_e2e_for_jira_key
+from app.main import create_app
+from app.models import Incident, WorkflowExecution
 from dataloadscripts.test_fixtures import JIRA_ISSUE_RS_173234, seed_catalog_db
 
 REAL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "dataloadscripts" / "npe_real_source_systems.yaml"
@@ -150,10 +155,54 @@ async def test_e2e_reports_no_playbook_when_none_configured(real_catalog_db, opa
 
 
 @respx.mock
-async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_creates_and_links_an_incident_row_for_the_requested_key(real_catalog_db, opa_url, monkeypatch):
+    """An /rca run must leave an Incident row (the dashboard and Retry tab
+    are built from them), keyed on the requested key and linked to every
+    execution -- and a second run refreshes that row, never duplicates it."""
     import app.opa_client as opa_client_module
 
     monkeypatch.setattr(opa_client_module, "OPA_URL", opa_url)
+    respx.route(host="localhost").pass_through()
+    respx.get("https://npetriage.atlassian.net/rest/api/3/issue/TT-9005").mock(
+        return_value=httpx.Response(200, json=JIRA_ISSUE_RS_173234)  # payload's own key differs on purpose
+    )
+
+    engine = make_async_engine(real_catalog_db)
+    session_factory = make_async_session_factory(engine)
+    try:
+        for _ in range(2):
+            async with session_factory() as session, httpx.AsyncClient() as client:
+                await run_e2e_for_jira_key(session, client, "TT-9005", jira_site="npetriage.atlassian.net")
+                await session.commit()
+
+        async with session_factory() as session:
+            incidents = (await session.scalars(select(Incident).where(Incident.jira_key == "TT-9005"))).all()
+            executions = (
+                await session.scalars(select(WorkflowExecution).where(WorkflowExecution.jira_key == "TT-9005"))
+            ).all()
+    finally:
+        await engine.dispose()
+
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident.source == "jira"
+    assert incident.classification_status == "resolved"
+    assert incident.source_system_id == "SYS_FIBER"
+    assert incident.subject == JIRA_ISSUE_RS_173234["fields"]["summary"]
+    assert len(executions) == 2
+    assert {e.incident_id for e in executions} == {incident.id}
+
+
+@respx.mock
+async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db, opa_url, monkeypatch):
+    import app.opa_client as opa_client_module
+    import app.workflow_orchestrator as orchestrator_module
+
+    monkeypatch.setattr(opa_client_module, "OPA_URL", opa_url)
+    # Earlier tests in this module leave SYS_FIBER incidents (and a
+    # correlation group) within the window, which would correctly turn this
+    # RCA "Correlated"; this test is about the Probable -> warning panel only.
+    monkeypatch.setattr(orchestrator_module, "correlate_incident", AsyncMock(return_value=None))
     respx.route(host="localhost").pass_through()
     respx.get("https://npetriage.atlassian.net/rest/api/3/issue/TT-9004").mock(
         return_value=httpx.Response(200, json=JIRA_ISSUE_RS_173234)
@@ -179,3 +228,20 @@ async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db,
     sent_body = comment_route.calls.last.request.content
     # functional_defect_recent_release -> rca_status.PROBABLE -> "warning" panel
     assert b'"panelType":"warning"' in sent_body or b'"panelType": "warning"' in sent_body
+
+
+@respx.mock
+def test_rca_endpoint_returns_404_for_a_ticket_jira_does_not_have(real_catalog_db, redis_url, rabbitmq_url, monkeypatch):
+    import app.routers.incidents as incidents_router
+
+    monkeypatch.setattr(incidents_router, "JIRA_SITE", "npetriage.atlassian.net")
+    respx.route(host="localhost").pass_through()
+    respx.route(host="127.0.0.1").pass_through()
+    respx.get("https://npetriage.atlassian.net/rest/api/3/issue/TT-404").mock(return_value=httpx.Response(404, json={}))
+
+    app = create_app(database_url=real_catalog_db, redis_url=redis_url, rabbitmq_url=rabbitmq_url)
+    with TestClient(app) as client:
+        response = client.post("/rca/TT-404")
+
+    assert response.status_code == 404
+    assert "TT-404" in response.json()["detail"]
