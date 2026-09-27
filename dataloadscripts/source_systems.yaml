@@ -1,0 +1,590 @@
+# ============================================
+# source_systems.yaml
+# Catalog + mapping rules + RCA playbooks
+# ============================================
+ 
+# -------------------------
+# SCHEMA (for reference)
+# -------------------------
+# SOURCE_SYSTEM:
+#   id            : string (PK)
+#   name          : string
+#   code          : string
+#   type          : string (Application | DataPipeline | Infra | Notification)
+#   description   : string
+#   owning_team   : string
+#   environment   : string (NPE | DEV | TEST | PROD)
+#
+# SYSTEM_FOOTPRINT:
+#   id              : string (PK)
+#   source_system_id: string (FK → SOURCE_SYSTEM.id)
+#   footprint_type  : string (hostname | url_pattern | table_name | pipeline_name | keyword)
+#   value           : string (literal or regex)
+#   notes           : string
+#
+# INCIDENT_MAPPING_RULE:
+#   id              : string (PK)
+#   source_system_id: string (FK → SOURCE_SYSTEM.id)
+#   category        : string (ENVIRONMENT / CONFIG, DATA QUALITY / TEST DATA, etc.)
+#   signal_type     : string (url | hostname | keyword | table_name | pipeline_name | jira_key)
+#   signal_pattern  : string (regex or simple match)
+#   priority        : integer (1 = highest priority)
+#   action          : string (assign_to_* | suggest_*)
+#
+# RCA_PLAYBOOK:
+#   id              : string (PK)
+#   source_system_id: string (FK → SOURCE_SYSTEM.id)
+#   category        : string
+#   steps           : list of:
+#       - check : string (check type, implemented in code)
+#         with: map   (check-specific parameters)
+ 
+# ============================================
+# SOURCE_SYSTEM
+# ============================================
+source_systems:
+  - id: SYS_DCD
+    name: Data Contract Dashboard
+    code: DCD
+    type: Application
+    description: Dashboard/UI for monitoring data contracts and QA checks in NPE.
+    owning_team: DSG-Data Contracts
+    environment: NPE
+ 
+  - id: SYS_DO
+    name: Data Orchestration Pipelines
+    code: DO
+    type: DataPipeline
+    description: Orchestration layer for ETL/ELT jobs feeding NPE data sets.
+    owning_team: DSG-Data Engineering
+    environment: NPE
+ 
+  - id: SYS_SAMSON
+    name: Samson App
+    code: SAMSON
+    type: Application
+    description: Core Samson application/service running in NPE.
+    owning_team: DSG-Samson Squad
+    environment: NPE
+ 
+  - id: SYS_DAS
+    name: Data Analytics Service
+    code: DAS
+    type: Application
+    description: Analytics and reporting service consuming NPE datasets.
+    owning_team: DSG-Analytics
+    environment: NPE
+ 
+  - id: SYS_DPS
+    name: Data Processing Service
+    code: DPS
+    type: DataPipeline
+    description: Batch/stream data processing service feeding downstream apps in NPE.
+    owning_team: DSG-Data Processing
+    environment: NPE
+ 
+# ============================================
+# SYSTEM_FOOTPRINT
+# ============================================
+system_footprints:
+  # DCD footprints
+  - id: SFP_DCD_HOST
+    source_system_id: SYS_DCD
+    footprint_type: hostname
+    value: dcd-npe.t-mobile.com
+    notes: Primary DCD NPE hostname
+ 
+  - id: SFP_DCD_URL
+    source_system_id: SYS_DCD
+    footprint_type: url_pattern
+    value: "https://dcd-npe.t-mobile.com/.*"
+    notes: Regex for all DCD NPE URLs
+ 
+  - id: SFP_DCD_TABLE
+    source_system_id: SYS_DCD
+    footprint_type: table_name
+    value: "DSNADEV.dcd_[A-Za-z0-9_]+"
+    notes: Pattern for DCD-owned tables in DSNADEV
+ 
+  - id: SFP_DCD_KEYWORD
+    source_system_id: SYS_DCD
+    footprint_type: keyword
+    value: DCD
+    notes: Keyword in incident titles/descriptions
+ 
+  # DO footprints
+  - id: SFP_DO_PIPELINE
+    source_system_id: SYS_DO
+    footprint_type: pipeline_name
+    value: "do[_-]npe[_-][A-Za-z0-9_-]+"
+    notes: Regex pattern for DO NPE pipelines
+ 
+  - id: SFP_DO_TABLE
+    source_system_id: SYS_DO
+    footprint_type: table_name
+    value: "DSNADEV.do_[A-Za-z0-9_]+"
+    notes: Pattern for DO-owned tables in DSNADEV
+ 
+  - id: SFP_DO_KEYWORD
+    source_system_id: SYS_DO
+    footprint_type: keyword
+    value: "Data Orchestration"
+    notes: Free-text references to DO
+ 
+  # SAMSON footprints
+  - id: SFP_SAMSON_HOST
+    source_system_id: SYS_SAMSON
+    footprint_type: hostname
+    value: samson-npe.t-mobile.com
+    notes: Samson NPE hostname
+ 
+  - id: SFP_SAMSON_URL
+    source_system_id: SYS_SAMSON
+    footprint_type: url_pattern
+    value: "https://samson-npe.t-mobile.com/.*"
+    notes: Regex for Samson NPE URLs
+ 
+  - id: SFP_SAMSON_KEYWORD
+    source_system_id: SYS_SAMSON
+    footprint_type: keyword
+    value: Samson
+    notes: Name mentioned in incident text
+ 
+  # DAS footprints
+  - id: SFP_DAS_HOST
+    source_system_id: SYS_DAS
+    footprint_type: hostname
+    value: das-npe.t-mobile.com
+    notes: DAS NPE hostname
+ 
+  - id: SFP_DAS_URL
+    source_system_id: SYS_DAS
+    footprint_type: url_pattern
+    value: "https://das-npe.t-mobile.com/.*"
+    notes: Regex for DAS NPE URLs
+ 
+  - id: SFP_DAS_TABLE
+    source_system_id: SYS_DAS
+    footprint_type: table_name
+    value: "DSNADEV.das_[A-Za-z0-9_]+"
+    notes: Pattern for DAS-owned tables in DSNADEV
+ 
+  - id: SFP_DAS_KEYWORD
+    source_system_id: SYS_DAS
+    footprint_type: keyword
+    value: DAS
+    notes: Keyword in incident titles/descriptions
+ 
+  # DPS footprints
+  - id: SFP_DPS_PIPELINE
+    source_system_id: SYS_DPS
+    footprint_type: pipeline_name
+    value: "dps[_-]npe[_-][A-Za-z0-9_-]+"
+    notes: Regex pattern for DPS NPE pipelines
+ 
+  - id: SFP_DPS_TABLE
+    source_system_id: SYS_DPS
+    footprint_type: table_name
+    value: "DSNADEV.dps_[A-Za-z0-9_]+"
+    notes: Pattern for DPS-owned tables in DSNADEV
+ 
+  - id: SFP_DPS_KEYWORD
+    source_system_id: SYS_DPS
+    footprint_type: keyword
+    value: DPS
+    notes: Keyword in incident text
+ 
+# ============================================
+# INCIDENT_MAPPING_RULE
+# ============================================
+incident_mapping_rules:
+  # DCD rules
+  - id: IMR_DCD_URL_ENV
+    source_system_id: SYS_DCD
+    category: "ENVIRONMENT / CONFIG"
+    signal_type: url
+    signal_pattern: ".*://dcd-npe\\.t-mobile\\.com/.*"
+    priority: 1
+    action: assign_to_DCD
+ 
+  - id: IMR_DCD_TABLE_DATA
+    source_system_id: SYS_DCD
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: table_name
+    signal_pattern: "\\bDSNADEV\\.dcd_[A-Za-z0-9_]+\\b"
+    priority: 1
+    action: assign_to_DCD
+ 
+  - id: IMR_DCD_KEY_FALLBACK
+    source_system_id: SYS_DCD
+    category: ANY
+    signal_type: keyword
+    signal_pattern: "\\bDCD\\b"
+    priority: 3
+    action: suggest_DCD
+ 
+  # DO rules
+  - id: IMR_DO_PIPE_DATA
+    source_system_id: SYS_DO
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: pipeline_name
+    signal_pattern: "\\bdo[_-]npe[_-][A-Za-z0-9_-]+\\b"
+    priority: 1
+    action: assign_to_DO
+ 
+  - id: IMR_DO_TABLE_DATA
+    source_system_id: SYS_DO
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: table_name
+    signal_pattern: "\\bDSNADEV\\.do_[A-Za-z0-9_]+\\b"
+    priority: 1
+    action: assign_to_DO
+ 
+  - id: IMR_DO_KEY_FALLBACK
+    source_system_id: SYS_DO
+    category: ANY
+    signal_type: keyword
+    signal_pattern: "\\bDO\\b"
+    priority: 3
+    action: suggest_DO
+ 
+  # SAMSON rules
+  - id: IMR_SAMSON_URL_ENV
+    source_system_id: SYS_SAMSON
+    category: "ENVIRONMENT / CONFIG"
+    signal_type: url
+    signal_pattern: ".*://samson-npe\\.t-mobile\\.com/.*"
+    priority: 1
+    action: assign_to_SAMSON
+ 
+  - id: IMR_SAMSON_KEY_FUNC
+    source_system_id: SYS_SAMSON
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bSamson\\b"
+    priority: 3
+    action: suggest_SAMSON
+ 
+  # DAS rules
+  - id: IMR_DAS_URL_ENV
+    source_system_id: SYS_DAS
+    category: "ENVIRONMENT / CONFIG"
+    signal_type: url
+    signal_pattern: ".*://das-npe\\.t-mobile\\.com/.*"
+    priority: 1
+    action: assign_to_DAS
+ 
+  - id: IMR_DAS_TABLE_DATA
+    source_system_id: SYS_DAS
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: table_name
+    signal_pattern: "\\bDSNADEV\\.das_[A-Za-z0-9_]+\\b"
+    priority: 1
+    action: assign_to_DAS
+ 
+  - id: IMR_DAS_KEY_FALLBACK
+    source_system_id: SYS_DAS
+    category: ANY
+    signal_type: keyword
+    signal_pattern: "\\bDAS\\b"
+    priority: 3
+    action: suggest_DAS
+ 
+  # DPS rules
+  - id: IMR_DPS_PIPE_DATA
+    source_system_id: SYS_DPS
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: pipeline_name
+    signal_pattern: "\\bdps[_-]npe[_-][A-Za-z0-9_-]+\\b"
+    priority: 1
+    action: assign_to_DPS
+ 
+  - id: IMR_DPS_TABLE_DATA
+    source_system_id: SYS_DPS
+    category: "DATA QUALITY / TEST DATA"
+    signal_type: table_name
+    signal_pattern: "\\bDSNADEV\\.dps_[A-Za-z0-9_]+\\b"
+    priority: 1
+    action: assign_to_DPS
+ 
+  - id: IMR_DPS_KEY_FALLBACK
+    source_system_id: SYS_DPS
+    category: ANY
+    signal_type: keyword
+    signal_pattern: "\\bDPS\\b"
+    priority: 3
+    action: suggest_DPS
+ 
+# ============================================
+# RCA_PLAYBOOKS
+# ============================================
+rca_playbooks:
+  # ------------------------------------------
+  # DCD – ENVIRONMENT / CONFIG
+  # ------------------------------------------
+  - id: RCA_DCD_ENV
+    source_system_id: SYS_DCD
+    category: "ENVIRONMENT / CONFIG"
+    steps:
+      - call: service_health
+        with:
+          env: NPE
+          endpoint: "https://dcd-npe.t-mobile.com/health"
+      - call: config_diff
+        with:
+          env: NPE
+          baseline_env: DEV
+          app: DCD
+          config_key_prefix: dcd
+      - call: email_suppression
+        with:
+          env: NPE
+          app: DCD
+          notification_service: "badge-email"   # example
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: DCD
+          lookback_minutes: 1440  # last 24h
+ 
+  # DCD – DATA QUALITY / TEST DATA
+  - id: RCA_DCD_DATA
+    source_system_id: SYS_DCD
+    category: "DATA QUALITY / TEST DATA"
+    steps:
+      - call: data_contract_violations
+        with:
+          env: NPE
+          system: DCD
+          severity_threshold: WARNING
+      - call: schema_mismatch
+        with:
+          env: NPE
+          reference_env: PROD
+          schema_pattern: "DSNADEV.dcd_*"
+      - call: null_density
+        with:
+          env: NPE
+          tables:
+            - "DSNADEV.dcd_*"
+          null_threshold_pct: 1.0
+      - call: recent_pipeline_changes
+        with:
+          env: NPE
+          related_system: DO
+          related_tables:
+            - "DSNADEV.dcd_*"
+          lookback_minutes: 1440
+ 
+  # ------------------------------------------
+  # DO – DATA QUALITY / TEST DATA
+  # ------------------------------------------
+  - id: RCA_DO_DATA
+    source_system_id: SYS_DO
+    category: "DATA QUALITY / TEST DATA"
+    steps:
+      - call: pipeline_status
+        with:
+          env: NPE
+          pipeline_name_pattern: "do[_-]npe[_-][A-Za-z0-9_-]+"
+      - call: pipeline_error_logs
+        with:
+          env: NPE
+          pipeline_name_pattern: "do[_-]npe[_-][A-Za-z0-9_-]+"
+          lookback_minutes: 720
+      - call: upstream_source_freshness
+        with:
+          env: NPE
+          pipelines:
+            - "do_npe_etl_main"
+          freshness_threshold_minutes: 120
+      - call: data_contract_violations
+        with:
+          env: NPE
+          system: DO
+          severity_threshold: WARNING
+ 
+  # DO – ENVIRONMENT / CONFIG
+  - id: RCA_DO_ENV
+    source_system_id: SYS_DO
+    category: "ENVIRONMENT / CONFIG"
+    steps:
+      - call: config_diff
+        with:
+          env: NPE
+          baseline_env: DEV
+          app: DO
+          config_key_prefix: do
+      - call: infra_health
+        with:
+          env: NPE
+          cluster: "do-npe-cluster"
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: DO
+          lookback_minutes: 1440
+ 
+  # ------------------------------------------
+  # SAMSON – ENVIRONMENT / CONFIG
+  # ------------------------------------------
+  - id: RCA_SAMSON_ENV
+    source_system_id: SYS_SAMSON
+    category: "ENVIRONMENT / CONFIG"
+    steps:
+      - call: service_health
+        with:
+          env: NPE
+          endpoint: "https://samson-npe.t-mobile.com/health"
+      - call: config_diff
+        with:
+          env: NPE
+          baseline_env: DEV
+          app: SAMSON
+          config_key_prefix: samson
+      - call: feature_flags
+        with:
+          env: NPE
+          app: SAMSON
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: SAMSON
+          lookback_minutes: 1440
+ 
+  # SAMSON – FUNCTIONAL DEFECT (QA/UAT)
+  - id: RCA_SAMSON_FUNC
+    source_system_id: SYS_SAMSON
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    steps:
+      - call: error_logs
+        with:
+          env: NPE
+          app: SAMSON
+          lookback_minutes: 240
+      - call: apm_traces
+        with:
+          env: NPE
+          app: SAMSON
+          lookback_minutes: 240
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: SAMSON
+          lookback_minutes: 1440
+      - call: dependent_services_health
+        with:
+          env: NPE
+          app: SAMSON
+          dependencies:
+            - DCD
+            - DO
+            - DPS
+ 
+  # ------------------------------------------
+  # DAS – ENVIRONMENT / CONFIG
+  # ------------------------------------------
+  - id: RCA_DAS_ENV
+    source_system_id: SYS_DAS
+    category: "ENVIRONMENT / CONFIG"
+    steps:
+      - call: service_health
+        with:
+          env: NPE
+          endpoint: "https://das-npe.t-mobile.com/health"
+      - call: config_diff
+        with:
+          env: NPE
+          baseline_env: DEV
+          app: DAS
+          config_key_prefix: das
+      - call: data_source_connectivity
+        with:
+          env: NPE
+          app: DAS
+          data_sources:
+            - "DSNADEV.das_*"
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: DAS
+          lookback_minutes: 1440
+ 
+  # DAS – DATA QUALITY / TEST DATA
+  - id: RCA_DAS_DATA
+    source_system_id: SYS_DAS
+    category: "DATA QUALITY / TEST DATA"
+    steps:
+      - call: data_contract_violations
+        with:
+          env: NPE
+          system: DAS
+          severity_threshold: WARNING
+      - call: schema_mismatch
+        with:
+          env: NPE
+          reference_env: PROD
+          schema_pattern: "DSNADEV.das_*"
+      - call: null_density
+        with:
+          env: NPE
+          tables:
+            - "DSNADEV.das_*"
+          null_threshold_pct: 1.0
+      - call: upstream_pipeline_status
+        with:
+          env: NPE
+          pipelines:
+            - "do_npe_*"
+            - "dps_npe_*"
+ 
+  # ------------------------------------------
+  # DPS – DATA QUALITY / TEST DATA
+  # ------------------------------------------
+  - id: RCA_DPS_DATA
+    source_system_id: SYS_DPS
+    category: "DATA QUALITY / TEST DATA"
+    steps:
+      - call: pipeline_status
+        with:
+          env: NPE
+          pipeline_name_pattern: "dps[_-]npe[_-][A-Za-z0-9_-]+"
+      - call: pipeline_error_logs
+        with:
+          env: NPE
+          pipeline_name_pattern: "dps[_-]npe[_-][A-Za-z0-9_-]+"
+          lookback_minutes: 720
+      - call: queue_lag
+        with:
+          env: NPE
+          queues:
+            - "dps-input"
+            - "dps-output"
+          lag_threshold: 1000
+      - call: data_contract_violations
+        with:
+          env: NPE
+          system: DPS
+          severity_threshold: WARNING
+ 
+  # DPS – ENVIRONMENT / CONFIG
+  - id: RCA_DPS_ENV
+    source_system_id: SYS_DPS
+    category: "ENVIRONMENT / CONFIG"
+    steps:
+      - call: infra_health
+        with:
+          env: NPE
+          cluster: "dps-npe-cluster"
+      - call: config_diff
+        with:
+          env: NPE
+          baseline_env: DEV
+          app: DPS
+          config_key_prefix: dps
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: DPS
+          lookback_minutes: 1440
+ 

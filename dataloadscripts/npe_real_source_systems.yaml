@@ -1,0 +1,715 @@
+# ============================================
+# npe_real_source_systems.yaml
+# Real catalog inferred from 39 production tickets.
+#
+# JUDGMENT CALL, FLAGGED FOR REVIEW: incident_mapping_rules.category has no
+# real taxonomy signal in the source data at all. Nearly
+# everything below defaults to "FUNCTIONAL DEFECT (QA/UAT)" (the tickets are
+# overwhelmingly app/API functional failures); only IDS (table/view data
+# issues) is assigned "DATA QUALITY / TEST DATA". This is a coarse first
+# pass, not a considered categorization -- correct freely.
+#
+# owning_team_id is set only where a team was clearly/frequently addressed in
+# the sample tickets (dpo-dice, dpo-omd); everything else is left unset
+# (owning_team free-text stays "TBD").
+# ============================================
+
+teams:
+  - id: TEAM_DPO_DICE
+    name: DPO DICE
+    teams_handle: dpo-dice
+    aliases: "DPO-DICE,DPO DICE Team"
+  - id: TEAM_DPO_OMD
+    name: DPO Order Management (DO)
+    teams_handle: dpo-omd
+    aliases: "DO Team"
+  - id: TEAM_DND
+    name: DND
+    teams_handle: DND
+  - id: TEAM_TRIAGE_NPE
+    name: DSG-Triage-NPE (generic)
+    teams_handle: DSG-Triage-NPE
+    aliases: "DSG-Triage-NPE Team"
+
+environments:
+  - id: ENV_QLAB01
+    code: QLAB01
+    name: QLAB01
+  - id: ENV_QLAB02
+    code: QLAB02
+    name: QLAB02
+  - id: ENV_QLAB03
+    code: QLAB03
+    name: QLAB03
+    aliases: "QLA03"
+  - id: ENV_QLAB04
+    code: QLAB04
+    name: QLAB04
+  - id: ENV_QLAB05
+    code: QLAB05
+    name: QLAB05
+  - id: ENV_QLAB06
+    code: QLAB06
+    name: QLAB06
+  - id: ENV_PIT03
+    code: PIT03
+    name: PIT03
+  - id: ENV_DEV2
+    code: DEV2
+    name: DEV2
+  - id: ENV_STG02
+    code: STG02
+    name: STG02
+  - id: ENV_PLAB01
+    code: PLAB01
+    name: PLAB01
+
+source_systems:
+  - id: SYS_DOTOOL
+    name: DO / Digital Orders
+    code: DOTOOL
+    type: Application
+    description: Order fulfillment/activation tool referenced constantly across tickets ("failing in DO", "DO tool").
+    owning_team: DPO Order Management (DO)
+    owning_team_id: TEAM_DPO_OMD
+    environment: NPE
+  - id: SYS_RSP
+    name: RSP (Real-time Service Provisioning)
+    code: RSP
+    type: Application
+    description: Backend provisioning/activation system, frequently named in errorSystem fields.
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_SAP
+    name: SAP (ERP / Fulfillment)
+    code: SAP
+    type: Application
+    description: ERP/order-fulfillment backend, referenced via SAP order ids and TARGET_SYSTEM=SAPPIREST.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_TPAS
+    name: TPAS (Account/Line Provisioning API)
+    code: TPAS
+    type: Application
+    description: Account/line provisioning API (v2/v3), tpas-reference-ui and tpasdo hostnames.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_ESIACCT
+    name: ESI Account Management
+    code: ESIACCT
+    type: Application
+    description: SOAP-based account management (BAN creation, service agreements).
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_CAMS
+    name: DSG-CAMS (Customer Account Mgmt Service)
+    code: CAMS
+    type: Application
+    description: Customer account management service, named directly in tickets ("DSG-CAMS").
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_DICE
+    name: DICE / DLM Device Lifecycle Events
+    code: DICE
+    type: Application
+    description: Trade-in and warranty/disposition device-lifecycle event system (Deep.io events).
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_ATLAS
+    name: ATLAS (Care/Dealer platform)
+    code: ATLAS
+    type: Application
+    description: Care/dealer front-end platform used to initiate DLM warranty and account flows.
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_TCA
+    name: TCA (dealer login tool)
+    code: TCA
+    type: Application
+    description: Dealer-facing login tool referenced in store-bypass flows.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_STIC
+    name: STIC (Apple Activation Auth)
+    code: STIC
+    type: Application
+    description: Apple STIC activation authentication flow (SticAuthenticateUser/SticFindParkedOrder).
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_REFDATA
+    name: Reference Data / DCO-Q2O
+    code: REFDATA
+    type: Application
+    description: Quote generation / reference data service (DCO URL generation, sync-quote).
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_WARRANTY
+    name: Warranty Eligibility Service
+    code: WARRANTY
+    type: Application
+    description: Device warranty eligibility rules API, invoked from ATLAS/DICE warranty flows.
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_QUATRO
+    name: Quatro / QTO Gateway (T-Life BFF)
+    code: QUATRO
+    type: Application
+    description: T-Life backend-for-frontend gateway routing to CXEDGE/CAMS/VASP.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_TLIFE
+    name: T-Life / Autopay
+    code: TLIFE
+    type: Application
+    description: T-Life mobile app (project prefix TLA), Autopay 1.5 flows.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_REBELLION
+    name: Rebellion (Prepaid retail web/app)
+    code: REBELLION
+    type: Application
+    description: Prepaid retail web/app, CHUB ID account-setup errors.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_BOSS
+    name: BOSS (Subsidy order system)
+    code: BOSS
+    type: Application
+    description: Subsidy order login/submission system.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_FIBER
+    name: Fiber OSA/DCS
+    code: FIBER
+    type: Application
+    description: Fiber order-submission/activation (dealer code validation).
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_HSI
+    name: HSI Gateway Activation
+    code: HSI
+    type: Application
+    description: HSI Gateway device activation flow.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_IDS
+    name: Integrated Data Store
+    code: IDS
+    type: DataPipeline
+    description: IDS source views fed by DO events (CDW_IDW_DB_*.IDW_CORE_V.* tables).
+    owning_team: DPO DICE
+    owning_team_id: TEAM_DPO_DICE
+    environment: NPE
+  - id: SYS_TPRE
+    name: TPre / Magenta Prepaid
+    code: TPRE
+    type: Application
+    description: Prepaid web app (guest pay, BYOD charge creation).
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_DASH
+    name: Care Dash AAL
+    code: DASH
+    type: Application
+    description: Care Dash subscriber-lookup application.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_TAX
+    name: Taxation Service
+    code: TAX
+    type: Application
+    description: Taxation quote/rest service, high-latency/failure reports.
+    owning_team: TBD
+    environment: NPE
+  - id: SYS_NUMMGT
+    name: Number/Score Management
+    code: NUMMGT
+    type: Application
+    description: Number management and score-eligibility service.
+    owning_team: TBD
+    environment: NPE
+
+system_footprints:
+  - id: SFP_DOTOOL_HOST
+    source_system_id: SYS_DOTOOL
+    footprint_type: hostname
+    value: "digital-qlab\\d+"
+    notes: Digital Orders web app hostnames across QLAB variants.
+  - id: SFP_DOTOOL_KEYWORD
+    source_system_id: SYS_DOTOOL
+    footprint_type: keyword
+    value: "\\bDO tool\\b|\\bDO Team\\b|failing in DO\\b"
+    notes: Frequent free-text references to the DO tool.
+  - id: SFP_RSP_KEYWORD
+    source_system_id: SYS_RSP
+    footprint_type: keyword
+    value: "\\bRSP\\b"
+  - id: SFP_RSP_ERRSYS
+    source_system_id: SYS_RSP
+    footprint_type: error_system
+    value: "RSP"
+  - id: SFP_SAP_KEYWORD
+    source_system_id: SYS_SAP
+    footprint_type: keyword
+    value: "\\bSAP\\b|\\bSAPPIREST\\b"
+  - id: SFP_SAP_ERRSYS
+    source_system_id: SYS_SAP
+    footprint_type: error_system
+    value: "SAPPIREST"
+  - id: SFP_TPAS_HOST
+    source_system_id: SYS_TPAS
+    footprint_type: hostname
+    value: "tpas"
+  - id: SFP_TPAS_KEYWORD
+    source_system_id: SYS_TPAS
+    footprint_type: keyword
+    value: "\\bTPAS\\b"
+  - id: SFP_ESIACCT_HOST
+    source_system_id: SYS_ESIACCT
+    footprint_type: hostname
+    value: "accountmgmt"
+  - id: SFP_ESIACCT_KEYWORD
+    source_system_id: SYS_ESIACCT
+    footprint_type: keyword
+    value: "esiCreateTentativeBanRequest|esiGetAllServiceAgreements"
+  - id: SFP_CAMS_HOST
+    source_system_id: SYS_CAMS
+    footprint_type: hostname
+    value: "-cams-"
+  - id: SFP_CAMS_KEYWORD
+    source_system_id: SYS_CAMS
+    footprint_type: keyword
+    value: "\\bDSG-CAMS\\b|\\bCAMS\\b"
+  - id: SFP_DICE_HOST
+    source_system_id: SYS_DICE
+    footprint_type: hostname
+    value: "-dice-"
+  - id: SFP_DICE_KEYWORD
+    source_system_id: SYS_DICE
+    footprint_type: keyword
+    value: "DICEDeviceTradeIn|tradeInOfferCompleted|billCreditCompleted"
+  - id: SFP_ATLAS_HOST
+    source_system_id: SYS_ATLAS
+    footprint_type: hostname
+    value: "globalnav"
+  - id: SFP_ATLAS_KEYWORD
+    source_system_id: SYS_ATLAS
+    footprint_type: keyword
+    value: "\\bATLAS\\b"
+  - id: SFP_TCA_KEYWORD
+    source_system_id: SYS_TCA
+    footprint_type: keyword
+    value: "Login TCA"
+  - id: SFP_STIC_KEYWORD
+    source_system_id: SYS_STIC
+    footprint_type: keyword
+    value: "SticAuthenticateUser|SticFindParkedOrder|\\bSTIC\\b"
+  - id: SFP_REFDATA_HOST
+    source_system_id: SYS_REFDATA
+    footprint_type: hostname
+    value: "referencedata"
+  - id: SFP_REFDATA_KEYWORD
+    source_system_id: SYS_REFDATA
+    footprint_type: keyword
+    value: "\\bDCO-Q2O\\b|Generate DCO URL"
+  - id: SFP_WARRANTY_HOST
+    source_system_id: SYS_WARRANTY
+    footprint_type: hostname
+    value: "warrantyeligibility"
+  - id: SFP_QUATRO_HOST
+    source_system_id: SYS_QUATRO
+    footprint_type: hostname
+    value: "qtorch|qto-router"
+  - id: SFP_QUATRO_KEYWORD
+    source_system_id: SYS_QUATRO
+    footprint_type: keyword
+    value: "\\bQuatro\\b"
+  - id: SFP_TLIFE_HOST
+    source_system_id: SYS_TLIFE
+    footprint_type: hostname
+    value: "luciq\\.ai"
+  - id: SFP_TLIFE_JIRAKEY
+    source_system_id: SYS_TLIFE
+    footprint_type: jira_key
+    value: "\\bTLA-\\d+\\b"
+  - id: SFP_REBELLION_KEYWORD
+    source_system_id: SYS_REBELLION
+    footprint_type: keyword
+    value: "\\bRebellion\\b|CHUB ID"
+  - id: SFP_BOSS_KEYWORD
+    source_system_id: SYS_BOSS
+    footprint_type: keyword
+    value: "Login to BOSS|\\bBOSS\\b"
+  - id: SFP_FIBER_HOST
+    source_system_id: SYS_FIBER
+    footprint_type: hostname
+    value: "\\.fiber\\.t-mobile\\.com"
+  - id: SFP_HSI_KEYWORD
+    source_system_id: SYS_HSI
+    footprint_type: keyword
+    value: "\\bHSI Gateway\\b|HSI orders"
+  - id: SFP_IDS_TABLE
+    source_system_id: SYS_IDS
+    footprint_type: table_name
+    value: "CDW_IDW_DB_\\w+\\.IDW_CORE_V\\.[A-Za-z0-9_]+"
+  - id: SFP_TPRE_HOST
+    source_system_id: SYS_TPRE
+    footprint_type: hostname
+    value: "\\.prepaid\\.t-mobile\\.com"
+  - id: SFP_DASH_HOST
+    source_system_id: SYS_DASH
+    footprint_type: hostname
+    value: "duck-stg-w2\\.kube"
+  - id: SFP_TAX_HOST
+    source_system_id: SYS_TAX
+    footprint_type: hostname
+    value: "taxation-restsvcs"
+  - id: SFP_NUMMGT_KEYWORD
+    source_system_id: SYS_NUMMGT
+    footprint_type: keyword
+    value: "NumberManagementWSIL|checkScoreEligibility"
+
+incident_mapping_rules:
+  - id: IMR_DOTOOL_HOST
+    source_system_id: SYS_DOTOOL
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "digital-qlab\\d+"
+    priority: 1
+    action: assign_to_DOTOOL
+  - id: IMR_DOTOOL_KEYWORD
+    source_system_id: SYS_DOTOOL
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bDO tool\\b|\\bDO Team\\b|failing in DO\\b"
+    priority: 3
+    action: suggest_DOTOOL
+  - id: IMR_RSP_ERRSYS
+    source_system_id: SYS_RSP
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: error_system
+    signal_pattern: "RSP"
+    priority: 1
+    action: assign_to_RSP
+  - id: IMR_RSP_KEYWORD
+    source_system_id: SYS_RSP
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bRSP\\b"
+    priority: 3
+    action: suggest_RSP
+  - id: IMR_SAP_ERRSYS
+    source_system_id: SYS_SAP
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: error_system
+    signal_pattern: "SAPPIREST"
+    priority: 1
+    action: assign_to_SAP
+  - id: IMR_SAP_KEYWORD
+    source_system_id: SYS_SAP
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bSAP\\b|\\bSAPPIREST\\b"
+    priority: 3
+    action: suggest_SAP
+  - id: IMR_TPAS_HOST
+    source_system_id: SYS_TPAS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "tpas"
+    priority: 1
+    action: assign_to_TPAS
+  - id: IMR_TPAS_KEYWORD
+    source_system_id: SYS_TPAS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bTPAS\\b"
+    priority: 3
+    action: suggest_TPAS
+  - id: IMR_ESIACCT_HOST
+    source_system_id: SYS_ESIACCT
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "accountmgmt"
+    priority: 1
+    action: assign_to_ESIACCT
+  - id: IMR_ESIACCT_KEYWORD
+    source_system_id: SYS_ESIACCT
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "esiCreateTentativeBanRequest|esiGetAllServiceAgreements"
+    priority: 3
+    action: suggest_ESIACCT
+  - id: IMR_CAMS_HOST
+    source_system_id: SYS_CAMS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "-cams-"
+    priority: 1
+    action: assign_to_CAMS
+  - id: IMR_CAMS_KEYWORD
+    source_system_id: SYS_CAMS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bDSG-CAMS\\b|\\bCAMS\\b"
+    priority: 3
+    action: suggest_CAMS
+  - id: IMR_DICE_HOST
+    source_system_id: SYS_DICE
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "-dice-"
+    priority: 1
+    action: assign_to_DICE
+  - id: IMR_DICE_KEYWORD
+    source_system_id: SYS_DICE
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "DICEDeviceTradeIn|tradeInOfferCompleted|billCreditCompleted"
+    priority: 3
+    action: suggest_DICE
+  - id: IMR_ATLAS_HOST
+    source_system_id: SYS_ATLAS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "globalnav"
+    priority: 1
+    action: assign_to_ATLAS
+  - id: IMR_ATLAS_KEYWORD
+    source_system_id: SYS_ATLAS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bATLAS\\b"
+    priority: 3
+    action: suggest_ATLAS
+  - id: IMR_TCA_KEYWORD
+    source_system_id: SYS_TCA
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "Login TCA"
+    priority: 3
+    action: suggest_TCA
+  - id: IMR_STIC_KEYWORD
+    source_system_id: SYS_STIC
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "SticAuthenticateUser|SticFindParkedOrder|\\bSTIC\\b"
+    priority: 3
+    action: suggest_STIC
+  - id: IMR_REFDATA_HOST
+    source_system_id: SYS_REFDATA
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "referencedata"
+    priority: 1
+    action: assign_to_REFDATA
+  - id: IMR_REFDATA_KEYWORD
+    source_system_id: SYS_REFDATA
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bDCO-Q2O\\b|Generate DCO URL"
+    priority: 3
+    action: suggest_REFDATA
+  - id: IMR_WARRANTY_HOST
+    source_system_id: SYS_WARRANTY
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "warrantyeligibility"
+    priority: 1
+    action: assign_to_WARRANTY
+  - id: IMR_QUATRO_HOST
+    source_system_id: SYS_QUATRO
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "qtorch|qto-router"
+    priority: 1
+    action: assign_to_QUATRO
+  - id: IMR_QUATRO_KEYWORD
+    source_system_id: SYS_QUATRO
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bQuatro\\b"
+    priority: 3
+    action: suggest_QUATRO
+  - id: IMR_TLIFE_HOST
+    source_system_id: SYS_TLIFE
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "luciq\\.ai"
+    priority: 1
+    action: assign_to_TLIFE
+  - id: IMR_TLIFE_JIRAKEY
+    source_system_id: SYS_TLIFE
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: jira_key
+    signal_pattern: "\\bTLA-\\d+\\b"
+    priority: 2
+    action: assign_to_TLIFE
+  - id: IMR_REBELLION_KEYWORD
+    source_system_id: SYS_REBELLION
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bRebellion\\b|CHUB ID"
+    priority: 3
+    action: suggest_REBELLION
+  - id: IMR_BOSS_KEYWORD
+    source_system_id: SYS_BOSS
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "Login to BOSS|\\bBOSS\\b"
+    priority: 3
+    action: suggest_BOSS
+  - id: IMR_FIBER_HOST
+    source_system_id: SYS_FIBER
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "\\.fiber\\.t-mobile\\.com"
+    priority: 1
+    action: assign_to_FIBER
+  - id: IMR_HSI_KEYWORD
+    source_system_id: SYS_HSI
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "\\bHSI Gateway\\b|HSI orders"
+    priority: 3
+    action: suggest_HSI
+  - id: IMR_IDS_TABLE
+    source_system_id: SYS_IDS
+    category: "DATA QUALITY / TEST DATA"
+    # signal_type=keyword, not table_name: app/incident_parser.py's
+    # TABLE_NAME_RE only extracts the fictional catalog's DSNADEV.* naming
+    # convention as a discrete table_name candidate. Real IDS tables follow
+    # a different convention (CDW_IDW_DB_*.IDW_CORE_V.*) that isn't
+    # extracted as table_name yet, so this rule matches via the keyword
+    # signal (full-text search) instead -- same regex, same effect.
+    signal_type: keyword
+    signal_pattern: "CDW_IDW_DB_\\w+\\.IDW_CORE_V\\.[A-Za-z0-9_]+"
+    priority: 1
+    action: assign_to_IDS
+  - id: IMR_TPRE_HOST
+    source_system_id: SYS_TPRE
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "\\.prepaid\\.t-mobile\\.com"
+    priority: 1
+    action: assign_to_TPRE
+  - id: IMR_DASH_HOST
+    source_system_id: SYS_DASH
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "duck-stg-w2\\.kube"
+    priority: 1
+    action: assign_to_DASH
+  - id: IMR_TAX_HOST
+    source_system_id: SYS_TAX
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: hostname
+    signal_pattern: "taxation-restsvcs"
+    priority: 1
+    action: assign_to_TAX
+  - id: IMR_NUMMGT_KEYWORD
+    source_system_id: SYS_NUMMGT
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    signal_type: keyword
+    signal_pattern: "NumberManagementWSIL|checkScoreEligibility"
+    priority: 3
+    action: suggest_NUMMGT
+
+# Three real playbooks authored to exercise the in-process
+# playbook executor + deterministic RCA synthesizer end-to-end (the E2E
+# bugID-to-RCA script). check_type results are currently stubbed (see
+# app/checks.py) -- no real Splunk/AppInsights/data-contract/CI-CD
+# integrations exist yet. The remaining 20 real systems still have no
+# playbook; that's expected, not a bug -- classification still resolves for
+# them, RCA execution just reports "no playbook configured yet."
+rca_playbooks:
+  - id: RCA_HSI_FUNC
+    source_system_id: SYS_HSI
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    steps:
+      - call: error_logs
+        with:
+          env: NPE
+          app: HSI
+          lookback_minutes: 240
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: HSI
+          lookback_minutes: 1440
+      - call: apm_traces
+        with:
+          env: NPE
+          app: HSI
+          lookback_minutes: 240
+          latency_threshold_ms: 2000
+      - call: dependent_services_health
+        with:
+          env: NPE
+          app: HSI
+          dependencies:
+            - SAP
+            - DOTOOL
+
+  - id: RCA_FIBER_FUNC
+    source_system_id: SYS_FIBER
+    category: "FUNCTIONAL DEFECT (QA/UAT)"
+    steps:
+      - call: error_logs
+        with:
+          env: NPE
+          app: FIBER
+          lookback_minutes: 240
+      - call: recent_deployments
+        with:
+          env: NPE
+          app: FIBER
+          lookback_minutes: 1440
+      - call: apm_traces
+        with:
+          env: NPE
+          app: FIBER
+          lookback_minutes: 240
+          latency_threshold_ms: 2000
+      - call: dependent_services_health
+        with:
+          env: NPE
+          app: FIBER
+          dependencies:
+            - SAP
+            - TCA
+
+  - id: RCA_IDS_DATA
+    source_system_id: SYS_IDS
+    category: "DATA QUALITY / TEST DATA"
+    steps:
+      - call: data_contract_violations
+        with:
+          env: NPE
+          system: IDS
+          severity_threshold: WARNING
+      - call: schema_mismatch
+        with:
+          env: NPE
+          reference_env: PROD
+          schema_pattern: "CDW_IDW_DB_*.IDW_CORE_V.*"
+      - call: null_density
+        with:
+          env: NPE
+          tables:
+            - "CDW_IDW_DB_QAT.IDW_CORE_V.DIGITAL_SALES_ORDER"
+          null_threshold_pct: 1.0
+      - call: recent_pipeline_changes
+        with:
+          env: NPE
+          related_system: DOTOOL
+          related_tables:
+            - "CDW_IDW_DB_*"
+          lookback_minutes: 1440

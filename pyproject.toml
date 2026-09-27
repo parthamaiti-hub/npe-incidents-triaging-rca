@@ -1,0 +1,33 @@
+[project]
+name = "npe-incidents-triaging"
+version = "0.1.0"
+description = "Automated RCA triage for non-production environment incidents"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "aio-pika>=9.4",
+    "redis>=5.2",
+    "msal>=1.31",
+    "python-dotenv>=1.0",
+    "openai>=1.54",
+    "pgvector>=0.3.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "testcontainers[postgres,rabbitmq,redis]>=4.8",
+    "respx>=0.21",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v -s --tb=short"

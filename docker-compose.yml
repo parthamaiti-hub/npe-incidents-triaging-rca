@@ -1,0 +1,63 @@
+services:
+  postgres:
+    # pgvector/pgvector:pg17 is the official pgvector-enabled
+    # image, built directly on postgres:17 -- drop-in compatible, just adds
+    # the `vector` extension used for RAG retrieval (classification
+    # footprints + feedback embeddings).
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: npe
+      POSTGRES_PASSWORD: npe
+      POSTGRES_DB: npe_triage
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U npe -d npe_triage"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # incident triage -- POST /incidents/{jira_key}/retry already covers
+  # visibility for local dev (localhost:15672, guest/guest).
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  opa:
+    image: openpolicyagent/opa:latest
+    command: ["run", "--server", "--addr", "0.0.0.0:8181", "/policies"]
+    volumes:
+      - ./opa/policies:/policies:ro
+    ports:
+      - "8181:8181"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      BACKEND_URL: http://host.docker.internal:8420
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:
