@@ -28,7 +28,7 @@ Teams channel poller (Graph + Jira) ┴─► idempotency (Valkey) ─► `incid
                                             │                    (re-classify with current rules) ──┐
                                             ▼                                                       │
      active approved playbook for (source_system, category) ◄────────────────────────────────────────┘
-       ─► playbook engine ─► evidence ─► correlation (Postgres, 24h window per application)
+       ─► playbook engine ─► evidence ─► correlation (MongoDB, 24h window per application)
        ─► RCA synthesis (deterministic, or LLM/RAG via Redis Stream + rca_worker) ─► execution record
 ```
 
@@ -42,8 +42,9 @@ Teams channel poller (Graph + Jira) ┴─► idempotency (Valkey) ─► `incid
 | Playbook engine | `app/workflow_orchestrator.py`, `app/playbook_engine.py` | Builds, versions, approves and executes playbooks |
 | Operator UI | `frontend/` | Next.js app on `:3001` |
 
-Infrastructure (via `docker-compose.yml`): Postgres 17 with pgvector (database `npe_triage_rca`), Valkey (Redis), RabbitMQ, OPA.
-Host ports are offset so this stack can run alongside another on the defaults: Postgres `5433`, Valkey `6380`,
+Infrastructure (via `docker-compose.yml`): MongoDB 8 as a single-node replica set (database `npe_triage_rca`, the
+source of truth), ChromaDB 1.5.9 (RAG vectors -- derived data, rebuildable from Mongo), Valkey (Redis), RabbitMQ, OPA.
+Host ports are offset so this stack can run alongside another on the defaults: MongoDB `27018`, Chroma `8011`, Valkey `6380`,
 RabbitMQ `5673` (management `15673`), OPA `8182`, API `8421`, UI `3001`.
 
 ---
@@ -60,7 +61,7 @@ copy .env.example .env         # then fill in real values (see Configuration)
 .\scripts\stop.ps1             # stop app processes, docker compose stop (data preserved)
 ```
 
-`start.ps1` waits for Postgres to be healthy, loads/seeds the catalogs, starts each process in the background, then
+`start.ps1` waits for MongoDB and Chroma to be healthy, loads/seeds the catalogs, starts each process in the background, then
 polls `/health`. PIDs and logs live under `.run\` (gitignored). Each process is skipped if it's already running, so
 after changing backend code run `stop.ps1 -KeepDockerRunning` then `start.ps1 -SkipCatalogLoad` to pick it up.
 
@@ -72,7 +73,7 @@ after changing backend code run `stop.ps1 -KeepDockerRunning` then `start.ps1 -S
 | `start.ps1 -SkipCatalogLoad` | Don't reload catalogs/seed data |
 | `start.ps1 -NoWorker` / `-NoPoller` / `-NoRcaWorker` / `-NoSweeper` | Skip that process |
 | `stop.ps1 -KeepDockerRunning` | Stop app processes only |
-| `stop.ps1 -RemoveVolumes` | Also wipe the Postgres volume (`docker compose down -v`) |
+| `stop.ps1 -RemoveVolumes` | Also wipe the MongoDB and Chroma volumes (`docker compose down -v`) |
 
 Check the stack is really up:
 
@@ -271,7 +272,7 @@ uv run pytest tests/test_checks.py              # one file
 uv run pytest tests/test_checks.py::test_x      # one test
 ```
 
-Tests start ephemeral Postgres, Valkey, RabbitMQ and OPA containers with testcontainers, so **Docker must be
+Tests start ephemeral MongoDB (replica set), Chroma, Valkey, RabbitMQ and OPA containers with testcontainers, so **Docker must be
 running**. Poller/Graph/Jira logic is covered by mocked tests using real sample-ticket fixtures.
 `tests/test_JIRA_Token.py` is a manual live-Jira connectivity check with a placeholder site; exclude it from routine
 runs with `--deselect tests/test_JIRA_Token.py::test_read_jira_ticket`.
@@ -292,11 +293,16 @@ playbook run makes an OpenAI call.
 
 ## Operational notes
 
-- **Windows event loop:** psycopg's async driver can't run on the default `ProactorEventLoop`. Start the API with
-  `scripts/run_dev_server.py`, not `uvicorn app.main:app` (fine on Linux/Docker).
+- **MongoDB is a replica set** (single-node locally): multi-document transactions need one. Connection strings use
+  `directConnection=true`.
+- **RAG vectors are derived data.** ChromaDB only holds embeddings of Mongo documents (footprints, classified
+  incidents, feedback). If it drifts (an embed failed, a volume was lost, the embedding model changed), run
+  `uv run python -m scripts.rebuild_vector_index --missing` (`--dry-run` to only report, `--only feedback` etc.). The
+  deterministic pipeline, and `/health`, don't need Chroma unless an LLM feature flag is on.
 - **Logs:** Python `logging` writes to stderr, which `start.ps1` sends to `.run\logs\<process>.err.log`.
-- **Schema changes:** there are no migrations; tables are created with `Base.metadata.create_all`. After a model
-  change, recreate the database (`.\scripts\stop.ps1 -RemoveVolumes`, then `start.ps1`).
+- **Schema changes:** there are no migrations. Collections and indexes are created by `app.db.ensure_indexes()` at
+  startup and by the load scripts. Adding a field needs nothing; changing an index definition needs the old index
+  dropped (or `.\scripts\stop.ps1 -RemoveVolumes`, then `start.ps1`).
 - **No linter/formatter or CI** is configured.
 
 ## Project layout

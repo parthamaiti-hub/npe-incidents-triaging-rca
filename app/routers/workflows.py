@@ -7,13 +7,15 @@ without a terminal.
 import datetime
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.errors import DuplicateKeyError
 
 from app.config import RCA_SYNTHESIS_LLM_ENABLED
-from app.db import get_async_session
+from app.db import get_db
 from app.embeddings import embed_feedback
 from app.llm_client import make_openai_client
 from app.models import (
@@ -35,7 +37,10 @@ from app.workflow_orchestrator import (
     preview_tasks,
     reject_build_request,
 )
+from app.repositories.base import find, get, insert
 from app.workflow_yaml import ParsedWorkflow, WorkflowYamlError, cncf_yaml_to_tasks, tasks_to_cncf_yaml
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
@@ -228,10 +233,10 @@ def _parse_yaml_or_422(text: str) -> ParsedWorkflow:
 
 
 @router.post("/build-requests", response_model=WorkflowBuildRequestOut, status_code=201)
-async def create_build_request(payload: BuildWorkflowRequestIn, session: AsyncSession = Depends(get_async_session)):
+async def create_build_request(payload: BuildWorkflowRequestIn, db: AsyncDatabase = Depends(get_db)):
     try:
         request = await build_workflow_from_request(
-            session,
+            db,
             payload.source_system_id,
             payload.category,
             payload.requested_functions,
@@ -247,82 +252,81 @@ async def create_build_request(payload: BuildWorkflowRequestIn, session: AsyncSe
 async def list_build_requests(
     status: str | None = None,
     source_system_id: str | None = None,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
-    stmt = select(WorkflowBuildRequest).order_by(WorkflowBuildRequest.created_at.desc())
+    filter = {}
     if status is not None:
-        stmt = stmt.where(WorkflowBuildRequest.status == status)
+        filter["status"] = status
     if source_system_id is not None:
-        stmt = stmt.where(WorkflowBuildRequest.source_system_id == source_system_id)
-    rows = (await session.scalars(stmt)).all()
+        filter["source_system_id"] = source_system_id
+    rows = await find(db, WorkflowBuildRequest, filter, sort=[("created_at", -1)])
     return [WorkflowBuildRequestOut.model_validate(r, from_attributes=True) for r in rows]
 
 
 @router.get("/build-requests/{request_id}", response_model=WorkflowBuildRequestOut)
-async def get_build_request(request_id: str, session: AsyncSession = Depends(get_async_session)):
-    row = await session.get(WorkflowBuildRequest, request_id)
+async def get_build_request(request_id: str, db: AsyncDatabase = Depends(get_db)):
+    row = await get(db, WorkflowBuildRequest, request_id)
     if row is None:
         raise HTTPException(404, f"WorkflowBuildRequest {request_id!r} not found")
     return WorkflowBuildRequestOut.model_validate(row, from_attributes=True)
 
 
 @router.post("/build-requests/{request_id}/approve", response_model=WorkflowDefinitionVersionOut)
-async def approve(request_id: str, payload: ApproveRequestIn, session: AsyncSession = Depends(get_async_session)):
+async def approve(request_id: str, payload: ApproveRequestIn, db: AsyncDatabase = Depends(get_db)):
     try:
-        version = await approve_build_request(session, request_id, payload.approved_by)
+        version = await approve_build_request(db, request_id, payload.approved_by)
     except WorkflowConflictError as exc:
         raise HTTPException(409, str(exc))
+    except DuplicateKeyError as exc:
+        # A concurrent approval for the same definition won the race.
+        raise HTTPException(409, f"Build request {request_id!r} conflicts with a concurrent approval -- retry") from exc
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     return WorkflowDefinitionVersionOut.model_validate(version, from_attributes=True)
 
 
 @router.post("/build-requests/{request_id}/reject", status_code=204)
-async def reject(request_id: str, payload: RejectRequestIn, session: AsyncSession = Depends(get_async_session)):
+async def reject(request_id: str, payload: RejectRequestIn, db: AsyncDatabase = Depends(get_db)):
     try:
-        await reject_build_request(session, request_id, payload.rejected_by, payload.reason)
+        await reject_build_request(db, request_id, payload.rejected_by, payload.reason)
     except ValueError as exc:
         raise HTTPException(404, str(exc))
 
 
 @router.get("/definitions", response_model=list[WorkflowDefinitionOut])
-async def list_definitions(session: AsyncSession = Depends(get_async_session)):
-    rows = (await session.scalars(select(WorkflowDefinition))).all()
+async def list_definitions(db: AsyncDatabase = Depends(get_db)):
+    rows = await find(db, WorkflowDefinition)
     return [WorkflowDefinitionOut.model_validate(r, from_attributes=True) for r in rows]
 
 
 @router.get("/definitions/{definition_id}/versions", response_model=list[WorkflowDefinitionVersionOut])
-async def list_versions(definition_id: str, session: AsyncSession = Depends(get_async_session)):
-    if await session.get(WorkflowDefinition, definition_id) is None:
+async def list_versions(definition_id: str, db: AsyncDatabase = Depends(get_db)):
+    if await get(db, WorkflowDefinition, definition_id) is None:
         raise HTTPException(404, f"WorkflowDefinition {definition_id!r} not found")
-    rows = (
-        await session.scalars(
-            select(WorkflowDefinitionVersion)
-            .where(WorkflowDefinitionVersion.workflow_definition_id == definition_id)
-            .order_by(WorkflowDefinitionVersion.version_number)
-        )
-    ).all()
+    rows = await find(
+        db, WorkflowDefinitionVersion, {"workflow_definition_id": definition_id}, sort=[("version_number", 1)]
+    )
     return [WorkflowDefinitionVersionOut.model_validate(r, from_attributes=True) for r in rows]
 
 
 @router.get("/active", response_model=WorkflowDefinitionVersionOut | None)
 async def active_workflow(
-    source_system_id: str, category: str, session: AsyncSession = Depends(get_async_session)
+    source_system_id: str, category: str, db: AsyncDatabase = Depends(get_db)
 ):
-    version = await get_active_workflow(session, source_system_id, category)
+    version = await get_active_workflow(db, source_system_id, category)
     if version is None:
         return None
     return WorkflowDefinitionVersionOut.model_validate(version, from_attributes=True)
 
 
 @router.get("/versions/{version_id}/yaml", response_model=WorkflowYamlOut)
-async def version_yaml(version_id: str, session: AsyncSession = Depends(get_async_session)):
+async def version_yaml(version_id: str, db: AsyncDatabase = Depends(get_db)):
     """A stored version rendered as CNCF Serverless Workflow YAML
     for the playbook editor's YAML pane."""
-    version = await session.get(WorkflowDefinitionVersion, version_id)
+    version = await get(db, WorkflowDefinitionVersion, version_id)
     if version is None:
         raise HTTPException(404, f"WorkflowDefinitionVersion {version_id!r} not found")
-    definition = await session.get(WorkflowDefinition, version.workflow_definition_id)
+    definition = await get(db, WorkflowDefinition, version.workflow_definition_id)
     return WorkflowYamlOut(
         yaml=tasks_to_cncf_yaml(version.document, name=_playbook_name(definition), version=version.version_number)
     )
@@ -339,7 +343,7 @@ async def render_yaml(payload: RenderYamlIn):
 
 
 @router.post("/validate-yaml", response_model=ValidateYamlOut)
-async def validate_yaml(payload: ValidateYamlIn, session: AsyncSession = Depends(get_async_session)):
+async def validate_yaml(payload: ValidateYamlIn, db: AsyncDatabase = Depends(get_db)):
     """Dry run -- YAML syntax, supported-DSL shape, then the same
     registry/implementation checks a real build runs. Never persists. 422
     detail is {kind: syntax|schema|registry, message, errors: [{message,
@@ -347,7 +351,7 @@ async def validate_yaml(payload: ValidateYamlIn, session: AsyncSession = Depends
     parsed = _parse_yaml_or_422(payload.yaml)
     base = None
     if payload.base_version_id is not None:
-        base = await session.get(WorkflowDefinitionVersion, payload.base_version_id)
+        base = await get(db, WorkflowDefinitionVersion, payload.base_version_id)
     try:
         tasks = preview_tasks(parsed.tasks, base)
     except WorkflowValidationError as exc:
@@ -357,7 +361,7 @@ async def validate_yaml(payload: ValidateYamlIn, session: AsyncSession = Depends
 
 @router.post("/definitions/{definition_id}/edits", response_model=WorkflowBuildRequestOut, status_code=201)
 async def edit_definition(
-    definition_id: str, payload: EditWorkflowIn, session: AsyncSession = Depends(get_async_session)
+    definition_id: str, payload: EditWorkflowIn, db: AsyncDatabase = Depends(get_db)
 ):
     """Saves an edit of the definition's approved version as a
     'rendered' build request (approve it via
@@ -367,7 +371,7 @@ async def edit_definition(
     tasks = parsed.tasks if parsed is not None else payload.tasks
     try:
         request = await edit_workflow_version(
-            session, definition_id, payload.base_version_id, tasks, payload.edited_by, payload.change_note
+            db, definition_id, payload.base_version_id, tasks, payload.edited_by, payload.change_note
         )
     except WorkflowValidationError as exc:
         raise _validation_422(exc, parsed)
@@ -380,30 +384,30 @@ async def edit_definition(
 
 @router.post("/versions/{version_id}/execute", response_model=WorkflowExecutionOut)
 async def execute_version(
-    version_id: str, payload: ExecuteRequestIn, session: AsyncSession = Depends(get_async_session)
+    version_id: str, payload: ExecuteRequestIn, db: AsyncDatabase = Depends(get_db)
 ):
     """Runs an already-approved version on demand (independent of the
     classify-then-lookup path app.e2e_pipeline drives) -- useful for a
     frontend "re-run this workflow" action."""
-    version = await session.get(WorkflowDefinitionVersion, version_id)
+    version = await get(db, WorkflowDefinitionVersion, version_id)
     if version is None:
         raise HTTPException(404, f"WorkflowDefinitionVersion {version_id!r} not found")
     if version.status != "approved":
         raise HTTPException(422, f"Version {version_id!r} is {version.status!r}, not 'approved'")
     execution = await execute_and_record(
-        session, version, jira_key=payload.jira_key, triggered_by="manual_execute", operator_context=payload.operator_context
+        db, version, jira_key=payload.jira_key, triggered_by="manual_execute", operator_context=payload.operator_context
     )
     return WorkflowExecutionOut.model_validate(execution, from_attributes=True)
 
 
 @router.get("/rca-patterns", response_model=list[RcaPatternTypeOut])
-async def list_rca_patterns(session: AsyncSession = Depends(get_async_session)):
+async def list_rca_patterns(db: AsyncDatabase = Depends(get_db)):
     """The RCA_PATTERN_TYPE catalog, for the feedback
     form's "correct pattern" dropdown -- active patterns only, so a
     retired one can't be newly selected as a correction (existing feedback
     rows that reference one keep displaying it via corrected_pattern_id
     regardless)."""
-    rows = (await session.scalars(select(RcaPatternType).where(RcaPatternType.status == "active"))).all()
+    rows = await find(db, RcaPatternType, {"status": "active"})
     return [RcaPatternTypeOut.model_validate(r, from_attributes=True) for r in rows]
 
 
@@ -411,22 +415,22 @@ async def list_rca_patterns(session: AsyncSession = Depends(get_async_session)):
 async def list_executions(
     jira_key: str | None = None,
     incident_key: str | None = None,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
     """Newest first. incident_key is the usual filter (every incident has
     one); jira_key still works for Jira-sourced runs."""
-    stmt = select(WorkflowExecution).order_by(WorkflowExecution.started_at.desc())
+    filter = {}
     if jira_key is not None:
-        stmt = stmt.where(WorkflowExecution.jira_key == jira_key)
+        filter["jira_key"] = jira_key
     if incident_key is not None:
-        stmt = stmt.where(WorkflowExecution.incident_key == incident_key)
-    rows = (await session.scalars(stmt)).all()
+        filter["incident_key"] = incident_key
+    rows = await find(db, WorkflowExecution, filter, sort=[("started_at", -1)])
     return [WorkflowExecutionOut.model_validate(r, from_attributes=True) for r in rows]
 
 
 @router.get("/executions/{execution_id}", response_model=WorkflowExecutionOut)
-async def get_execution(execution_id: str, session: AsyncSession = Depends(get_async_session)):
-    row = await session.get(WorkflowExecution, execution_id)
+async def get_execution(execution_id: str, db: AsyncDatabase = Depends(get_db)):
+    row = await get(db, WorkflowExecution, execution_id)
     if row is None:
         raise HTTPException(404, f"WorkflowExecution {execution_id!r} not found")
     return WorkflowExecutionOut.model_validate(row, from_attributes=True)
@@ -434,15 +438,18 @@ async def get_execution(execution_id: str, session: AsyncSession = Depends(get_a
 
 @router.post("/executions/{execution_id}/feedback", response_model=RcaFeedbackOut, status_code=201)
 async def add_feedback(
-    execution_id: str, payload: RcaFeedbackIn, session: AsyncSession = Depends(get_async_session)
+    execution_id: str, payload: RcaFeedbackIn, request: Request, db: AsyncDatabase = Depends(get_db)
 ):
     """Operator feedback on one RCA attempt -- comment plus
     a 1-5 confidence score, plus an optional structured
     correction. Multiple entries per execution are allowed, a feedback
     thread rather than a single overwritable field."""
-    execution = await session.get(WorkflowExecution, execution_id)
+    execution = await get(db, WorkflowExecution, execution_id)
     if execution is None:
         raise HTTPException(404, f"WorkflowExecution {execution_id!r} not found")
+    # What the rca_pattern_type foreign key used to refuse.
+    if payload.corrected_pattern_id is not None and await get(db, RcaPatternType, payload.corrected_pattern_id) is None:
+        raise HTTPException(422, f"corrected_pattern_id={payload.corrected_pattern_id!r} references unknown RcaPatternType")
     feedback = RcaFeedback(
         workflow_execution_id=execution_id,
         comment=payload.comment,
@@ -451,30 +458,26 @@ async def add_feedback(
         corrected_pattern_id=payload.corrected_pattern_id,
         corrected_rca_status=payload.corrected_rca_status,
     )
-    session.add(feedback)
-    await session.commit()
+    await insert(db, feedback)
 
     # Feeds the RAG corpus future RCA synthesis grounds on --
     # gated on RCA_SYNTHESIS_LLM_ENABLED (the feature that actually reads
     # this corpus), not just "always embed," so this never makes an
     # OpenAI call with no real key behind it while the feature is off.
+    # Best-effort: the feedback is already stored, and a missing vector is
+    # repaired by scripts/rebuild_vector_index.py --only feedback --missing.
     if RCA_SYNTHESIS_LLM_ENABLED:
-        client = make_openai_client()
-        await embed_feedback(session, client, feedback, execution)
-        await session.commit()
+        try:
+            await embed_feedback(request.app.state.vector_store, make_openai_client(), feedback, execution)
+        except Exception as exc:  # noqa: BLE001 -- see comment above
+            logger.warning("Embedding failed for feedback %s (feedback already stored): %s", feedback.id, exc)
 
     return RcaFeedbackOut.model_validate(feedback, from_attributes=True)
 
 
 @router.get("/executions/{execution_id}/feedback", response_model=list[RcaFeedbackOut])
-async def list_feedback(execution_id: str, session: AsyncSession = Depends(get_async_session)):
-    if await session.get(WorkflowExecution, execution_id) is None:
+async def list_feedback(execution_id: str, db: AsyncDatabase = Depends(get_db)):
+    if await get(db, WorkflowExecution, execution_id) is None:
         raise HTTPException(404, f"WorkflowExecution {execution_id!r} not found")
-    rows = (
-        await session.scalars(
-            select(RcaFeedback)
-            .where(RcaFeedback.workflow_execution_id == execution_id)
-            .order_by(RcaFeedback.created_at)
-        )
-    ).all()
+    rows = await find(db, RcaFeedback, {"workflow_execution_id": execution_id}, sort=[("created_at", 1)])
     return [RcaFeedbackOut.model_validate(r, from_attributes=True) for r in rows]

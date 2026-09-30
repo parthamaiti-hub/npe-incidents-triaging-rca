@@ -4,8 +4,6 @@ version = "0.1.0"
 description = "Automated RCA triage for non-production environment incidents"
 requires-python = ">=3.12"
 dependencies = [
-    "sqlalchemy>=2.0.36",
-    "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "pyyaml>=6.0",
     "fastapi>=0.115",
@@ -16,14 +14,15 @@ dependencies = [
     "msal>=1.31",
     "python-dotenv>=1.0",
     "openai>=1.54",
-    "pgvector>=0.3.6",
+    "pymongo>=4.13",
+    "chromadb-client==1.5.9",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "testcontainers[postgres,rabbitmq,redis]>=4.8",
+    "testcontainers[rabbitmq,redis]>=4.8",
     "respx>=0.21",
 ]
 

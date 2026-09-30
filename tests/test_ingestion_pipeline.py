@@ -3,9 +3,8 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
-from app.db import Base, make_async_engine, make_async_session_factory, make_engine, make_session_factory
+from app.db import make_sync_mongo_client
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
 from app.idempotency import make_dedup_key, make_redis
 from app.incident_parser import parse_template
@@ -16,27 +15,40 @@ from dataloadscripts.test_fixtures import (
     DUPLICATE_TEST_TEXT,
     NO_FOOTPRINT_TEXT,
     WORKED_TRACE_TEXT,
-    seed_catalog_db,
+    find_docs,
+    get_doc,
+    open_db,
+    seeded_catalog_database,
 )
 
 
 @pytest.fixture(scope="module")
-def loaded_catalog_db(postgres_url):
-    engine = seed_catalog_db(postgres_url)
-    yield postgres_url
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def loaded_catalog_db(mongo_url):
+    """(mongo_url, database name) -- shared by the whole module."""
+    with seeded_catalog_database(mongo_url) as name:
+        yield mongo_url, name
+
+
+@pytest.fixture(scope="module")
+def catalog_sync_db(loaded_catalog_db):
+    mongo_url, name = loaded_catalog_db
+    client = make_sync_mongo_client(mongo_url)
+    yield client[name]
+    client.close()
 
 
 @pytest.fixture()
-def app(loaded_catalog_db, redis_url, rabbitmq_url, opa_url, monkeypatch):
+def app(loaded_catalog_db, redis_url, rabbitmq_url, opa_url, vector_store, monkeypatch):
     import app.opa_client as opa_client_module
 
     monkeypatch.setattr(opa_client_module, "OPA_URL", opa_url)
+    mongo_url, name = loaded_catalog_db
     return create_app(
-        database_url=loaded_catalog_db,
+        mongodb_url=mongo_url,
+        mongodb_db=name,
         redis_url=redis_url,
         rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
     )
 
 
@@ -46,50 +58,37 @@ def _classify_next_message(loaded_catalog_db, rabbitmq_url) -> dict:
     (FIFO per queue) -- no shared consumer group required."""
 
     async def _run() -> dict:
-        engine = make_async_engine(loaded_catalog_db)
-        session_factory = make_async_session_factory(engine)
         connection = await make_connection(rabbitmq_url)
         channel = await make_channel(connection)
         queue = await declare_incidents_raw(channel)
         try:
-            async with queue.iterator() as iterator:
+            async with open_db(*loaded_catalog_db) as db, queue.iterator() as iterator:
                 message = await consume_one(iterator, timeout=20.0)
                 assert message is not None, "expected a message on incidents.raw but none arrived"
                 payload = decode(message)
-                await process_message(session_factory, payload)
+                await process_message(db, payload)
                 await message.ack()
                 return payload
         finally:
             await connection.close()
-            await engine.dispose()
 
     return asyncio.run(_run())
 
 
-def _get_incident(loaded_catalog_db, incident_id: str) -> Incident:
-    engine = make_engine(loaded_catalog_db)
-    session_factory = make_session_factory(engine)
-    with session_factory() as session:
-        return session.get(Incident, incident_id)
+def _get_incident(catalog_sync_db, incident_id: str) -> Incident:
+    return get_doc(catalog_sync_db, Incident, incident_id)
 
 
-def _executions(loaded_catalog_db, incident_id: str) -> list[WorkflowExecution]:
-    engine = make_engine(loaded_catalog_db)
-    with make_session_factory(engine)() as session:
-        rows = session.scalars(select(WorkflowExecution).where(WorkflowExecution.incident_id == incident_id)).all()
-    engine.dispose()
-    return list(rows)
+def _executions(catalog_sync_db, incident_id: str) -> list[WorkflowExecution]:
+    return find_docs(catalog_sync_db, WorkflowExecution, {"incident_id": incident_id})
 
 
 async def _process_again(loaded_catalog_db, payload: dict) -> None:
-    engine = make_async_engine(loaded_catalog_db)
-    try:
-        await process_message(make_async_session_factory(engine), payload)
-    finally:
-        await engine.dispose()
+    async with open_db(*loaded_catalog_db) as db:
+        await process_message(db, payload)
 
 
-def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbitmq_url):
+def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
     with TestClient(app) as client:
         response = client.post("/webhooks/teams", json={"id": "msg-1", "text": WORKED_TRACE_TEXT})
         assert response.status_code == 200
@@ -100,7 +99,7 @@ def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbi
     message = _classify_next_message(loaded_catalog_db, rabbitmq_url)
     assert message["incident_id"] == incident_id
 
-    incident = _get_incident(loaded_catalog_db, incident_id)
+    incident = _get_incident(catalog_sync_db, incident_id)
     print(
         f"\n[OUTCOME] incident_id={incident.id} status={incident.classification_status} "
         f"source_system_id={incident.source_system_id} category={incident.category!r} "
@@ -114,7 +113,7 @@ def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbi
     assert re.match(r"^int_\d{14}_\d{5}$", incident.incident_key)  # generated, no Jira key
 
     # The worker ran the first RCA automatically: SYS_DCD has a playbook.
-    (execution,) = _executions(loaded_catalog_db, incident_id)
+    (execution,) = _executions(catalog_sync_db, incident_id)
     assert execution.triggered_by == "auto"
     assert execution.incident_key == incident.incident_key
     assert execution.workflow_definition_version_id is not None
@@ -122,10 +121,10 @@ def test_worked_trace_resolves_dcd_data_end_to_end(app, loaded_catalog_db, rabbi
 
     # A redelivered message re-classifies but doesn't run a second automatic RCA.
     asyncio.run(_process_again(loaded_catalog_db, message))
-    assert len(_executions(loaded_catalog_db, incident_id)) == 1
+    assert len(_executions(catalog_sync_db, incident_id)) == 1
 
 
-def test_duplicate_incident_is_deduped(app, loaded_catalog_db, rabbitmq_url):
+def test_duplicate_incident_is_deduped(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
     with TestClient(app) as client:
         first = client.post("/webhooks/teams", json={"id": "msg-2", "text": DUPLICATE_TEST_TEXT})
         assert first.json()["status"] == "accepted"
@@ -141,7 +140,7 @@ def test_duplicate_incident_is_deduped(app, loaded_catalog_db, rabbitmq_url):
     assert message["incident_id"] == first_incident_id
 
 
-def test_no_footprint_incident_routes_to_manual_triage(app, loaded_catalog_db, rabbitmq_url):
+def test_no_footprint_incident_routes_to_manual_triage(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
     with TestClient(app) as client:
         response = client.post("/webhooks/teams", json={"id": "msg-4", "text": NO_FOOTPRINT_TEXT})
         incident_id = response.json()["incident_id"]
@@ -149,7 +148,7 @@ def test_no_footprint_incident_routes_to_manual_triage(app, loaded_catalog_db, r
     message = _classify_next_message(loaded_catalog_db, rabbitmq_url)
     assert message["incident_id"] == incident_id
 
-    incident = _get_incident(loaded_catalog_db, incident_id)
+    incident = _get_incident(catalog_sync_db, incident_id)
     print(
         f"\n[OUTCOME] incident_id={incident.id} status={incident.classification_status} "
         f"source_system_id={incident.source_system_id} category={incident.category}"
@@ -159,13 +158,13 @@ def test_no_footprint_incident_routes_to_manual_triage(app, loaded_catalog_db, r
     assert incident.category is None
 
     # Nothing to run, but the automatic RCA attempt is still recorded.
-    (execution,) = _executions(loaded_catalog_db, incident_id)
+    (execution,) = _executions(catalog_sync_db, incident_id)
     assert execution.triggered_by == "auto"
     assert execution.workflow_definition_version_id is None
     assert execution.rca["matched_pattern"] == "not_classified"
 
 
-def test_jira_webhook_ingests_and_classifies(app, loaded_catalog_db, rabbitmq_url):
+def test_jira_webhook_ingests_and_classifies(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
     with TestClient(app) as client:
         response = client.post(
             "/webhooks/jira",
@@ -185,7 +184,7 @@ def test_jira_webhook_ingests_and_classifies(app, loaded_catalog_db, rabbitmq_ur
     message = _classify_next_message(loaded_catalog_db, rabbitmq_url)
     assert message["incident_id"] == incident_id
 
-    incident = _get_incident(loaded_catalog_db, incident_id)
+    incident = _get_incident(catalog_sync_db, incident_id)
     print(
         f"\n[OUTCOME] source={incident.source} external_id={incident.external_id} "
         f"status={incident.classification_status} source_system_id={incident.source_system_id} "
@@ -218,11 +217,11 @@ def test_ingest_failure_releases_idempotency_claim_for_retry(app, loaded_catalog
     real_create = webhooks_module.create_incident_record
     calls = {"n": 0}
 
-    async def flaky_create(session, source, external_id, raw_text):
+    async def flaky_create(db, source, external_id, raw_text):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("simulated DB failure after the idempotency claim")
-        return await real_create(session, source, external_id, raw_text)
+        return await real_create(db, source, external_id, raw_text)
 
     monkeypatch.setattr(webhooks_module, "create_incident_record", flaky_create)
 
@@ -251,3 +250,38 @@ def test_ingest_failure_releases_idempotency_claim_for_retry(app, loaded_catalog
 
     message = _classify_next_message(loaded_catalog_db, rabbitmq_url)  # drain so the shared queue stays in sync
     assert message["incident_id"] == incident_id
+
+
+def test_two_webhook_incidents_without_jira_keys_coexist(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
+    """jira_key's unique index must be partial: most webhook incidents have
+    no Jira key, and a plain unique index would treat those nulls as equal
+    and refuse the second one."""
+    texts = [
+        NO_FOOTPRINT_TEXT.replace("10:00 ET", "10:01 ET").replace("unrelated incident", "unrelated incident A"),
+        NO_FOOTPRINT_TEXT.replace("10:00 ET", "10:02 ET").replace("unrelated incident", "unrelated incident B"),
+    ]
+    with TestClient(app) as client:
+        responses = [client.post("/webhooks/teams", json={"id": f"msg-null-{i}", "text": t}) for i, t in enumerate(texts)]
+
+    assert [r.status_code for r in responses] == [200, 200]
+    ids = [r.json()["incident_id"] for r in responses]
+    incidents = [_get_incident(catalog_sync_db, i) for i in ids]
+    assert [i.jira_key for i in incidents] == [None, None]
+    assert incidents[0].incident_key != incidents[1].incident_key
+
+    for incident_id in ids:  # drain so the shared queue stays in sync
+        assert _classify_next_message(loaded_catalog_db, rabbitmq_url)["incident_id"] == incident_id
+
+
+def test_same_source_and_external_id_twice_is_409(app, loaded_catalog_db, catalog_sync_db, rabbitmq_url):
+    """(source, external_id) is unique; a re-sent event that slips past the
+    content fingerprint (different text) is a conflict, not a 500."""
+    first_text = DUPLICATE_TEST_TEXT.replace("11:15 ET", "11:16 ET").replace("DEDUP TEST", "SOURCE ID TEST 1")
+    second_text = DUPLICATE_TEST_TEXT.replace("11:15 ET", "11:17 ET").replace("DEDUP TEST", "SOURCE ID TEST 2")
+    with TestClient(app) as client:
+        first = client.post("/webhooks/teams", json={"id": "msg-same-id", "text": first_text})
+        second = client.post("/webhooks/teams", json={"id": "msg-same-id", "text": second_text})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert _classify_next_message(loaded_catalog_db, rabbitmq_url)["incident_id"] == first.json()["incident_id"]

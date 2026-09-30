@@ -4,10 +4,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg://npe:npe@localhost:5433/npe_triage_rca",
-)
+# MongoDB is the source of truth. It must be a replica set (a single-node
+# one locally, see docker-compose.yml): multi-document transactions need
+# it. directConnection=true because the member advertises its in-container
+# hostname, which isn't resolvable from the host.
+MONGODB_URL = os.environ.get("MONGODB_URL", "mongodb://localhost:27018/?directConnection=true")
+MONGODB_DB = os.environ.get("MONGODB_DB", "npe_triage_rca")
+
+# ChromaDB holds the RAG vector corpora -- derived data, rebuildable from
+# MongoDB with scripts/rebuild_vector_index.py. Only the LLM/RAG paths use it.
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8011"))
+CHROMA_SSL = os.environ.get("CHROMA_SSL", "false").lower() == "true"
+CHROMA_AUTH_TOKEN = os.environ.get("CHROMA_AUTH_TOKEN", "")
+CHROMA_COLLECTION_PREFIX = os.environ.get("CHROMA_COLLECTION_PREFIX", "npe_")
+
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 OPA_URL = os.environ.get("OPA_URL", "http://localhost:8182")
 
@@ -100,6 +111,12 @@ RCA_SYNTHESIS_LLM_ENABLED = os.environ.get("RCA_SYNTHESIS_LLM_ENABLED", "false")
 # out to be too aggressive.
 RAG_EMBED_FEEDBACK_ONLY = os.environ.get("RAG_EMBED_FEEDBACK_ONLY", "true").lower() == "true"
 RAG_RETENTION_MONTHS = int(os.environ.get("RAG_RETENTION_MONTHS", "6"))
+
+# Chroma doesn't prune by itself. When set, app.sweeper deletes incident
+# classification vectors older than this many months (footprints are catalog
+# data and are never pruned). Unset keeps everything.
+_classification_retention = os.environ.get("RAG_CLASSIFICATION_RETENTION_MONTHS", "").strip()
+RAG_CLASSIFICATION_RETENTION_MONTHS = int(_classification_retention) if _classification_retention else None
 
 # Redis Stream (Valkey, already deployed for idempotency). Decouples RCA
 # synthesis's LLM latency from execute_and_record's request path.

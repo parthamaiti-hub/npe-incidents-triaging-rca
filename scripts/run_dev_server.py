@@ -1,19 +1,15 @@
-"""Local dev server runner. uvicorn's default Windows loop factory always
-returns ProactorEventLoop (see uvicorn.loops.asyncio.asyncio_loop_factory),
-which psycopg's async driver cannot run under -- and it ignores the ambient
-asyncio event loop policy, so setting the policy alone doesn't fix it. Not
-needed in the Linux Docker Compose deployment -- there,
-`uvicorn app.main:app` works directly.
+"""Local dev server runner -- the API on :8421, same as
+`uvicorn app.main:app --host 0.0.0.0 --port 8421`.
+
+(It used to force a SelectorEventLoop on Windows for psycopg's async
+driver; PyMongo's async client and the Chroma HTTP client run on the
+default loop, so that's gone.)
 
 Usage:
-    uv run python scripts/run_dev_server.py
+    uv run python -m scripts.run_dev_server
 """
-
-import asyncio
-import sys
 
 import uvicorn
 
 if __name__ == "__main__":
-    loop = asyncio.SelectorEventLoop if sys.platform == "win32" else "auto"
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8421, reload=False, loop=loop)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8421, reload=False)

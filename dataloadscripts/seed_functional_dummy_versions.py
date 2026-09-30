@@ -22,61 +22,49 @@ Usage:
     uv run python -m dataloadscripts.seed_functional_dummy_versions
 """
 
-import uuid
-
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.check_implementations import CHECK_IMPLEMENTATIONS_V2
-from app.db import Base, make_engine, make_session_factory
+from app.db import ensure_indexes_sync, get_database, make_sync_mongo_client
 from app.function_registry import DEFAULT_FUNCTION_REGISTRY
 from app.models import FunctionDefinition, FunctionDefinitionVersion
 
 DUMMY_CREATED_BY = "functional_dummy_seed"
 
 
-def publish_functional_dummy_versions(session: Session) -> int:
+def publish_functional_dummy_versions(db: Database) -> int:
     """Returns how many functions got a newly-published v2 (functions that
     already had an active v2 are skipped, not re-published)."""
-    published = 0
-    for name, spec in DEFAULT_FUNCTION_REGISTRY.items():
-        if name not in CHECK_IMPLEMENTATIONS_V2:
-            continue  # no real v2 code for this check_type yet -- nothing to publish
+    definitions = db[FunctionDefinition.COLLECTION]
+    versions = db[FunctionDefinitionVersion.COLLECTION]
 
-        if session.get(FunctionDefinition, name) is None:
-            session.add(FunctionDefinition(id=name))
-            session.flush()
+    def publish(session) -> int:
+        published = 0
+        for name, spec in DEFAULT_FUNCTION_REGISTRY.items():
+            if name not in CHECK_IMPLEMENTATIONS_V2:
+                continue  # no real v2 code for this check_type yet -- nothing to publish
 
-        existing_v2 = session.scalars(
-            select(FunctionDefinitionVersion).where(
-                FunctionDefinitionVersion.function_definition_id == name,
-                FunctionDefinitionVersion.version_number == 2,
-            )
-        ).first()
+            if definitions.find_one({"_id": name}, session=session) is None:
+                definitions.insert_one(FunctionDefinition(id=name).to_doc(), session=session)
 
-        if existing_v2 is not None:
-            if existing_v2.status != "active":
-                for other in session.scalars(
-                    select(FunctionDefinitionVersion).where(
-                        FunctionDefinitionVersion.function_definition_id == name,
-                        FunctionDefinitionVersion.status == "active",
+            existing_v2 = versions.find_one({"function_definition_id": name, "version_number": 2}, session=session)
+
+            # Always supersede the current active version *before* activating
+            # another one: one active version per function is index-enforced.
+            if existing_v2 is not None:
+                if existing_v2["status"] != "active":
+                    versions.update_many(
+                        {"function_definition_id": name, "status": "active"},
+                        {"$set": {"status": "superseded"}},
+                        session=session,
                     )
-                ).all():
-                    other.status = "superseded"
-                existing_v2.status = "active"
-            continue
+                    versions.update_one({"_id": existing_v2["_id"]}, {"$set": {"status": "active"}}, session=session)
+                continue
 
-        for current_active in session.scalars(
-            select(FunctionDefinitionVersion).where(
-                FunctionDefinitionVersion.function_definition_id == name,
-                FunctionDefinitionVersion.status == "active",
+            versions.update_many(
+                {"function_definition_id": name, "status": "active"}, {"$set": {"status": "superseded"}}, session=session
             )
-        ).all():
-            current_active.status = "superseded"
-
-        session.add(
-            FunctionDefinitionVersion(
-                id=str(uuid.uuid4()),
+            version = FunctionDefinitionVersion(
                 function_definition_id=name,
                 version_number=2,
                 description=(
@@ -89,20 +77,22 @@ def publish_functional_dummy_versions(session: Session) -> int:
                 status="active",
                 created_by=DUMMY_CREATED_BY,
             )
-        )
-        published += 1
+            versions.insert_one(version.to_doc(), session=session)
+            published += 1
+        return published
 
-    session.commit()
-    return published
+    with db.client.start_session() as session:
+        return session.with_transaction(publish)
 
 
 def main() -> None:
-    engine = make_engine()
-    Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-
-    with session_factory() as session:
-        published = publish_functional_dummy_versions(session)
+    client = make_sync_mongo_client()
+    try:
+        db = get_database(client)
+        ensure_indexes_sync(db)
+        published = publish_functional_dummy_versions(db)
+    finally:
+        client.close()
 
     print(f"Published functional dummy v2 for {published} functions ({len(CHECK_IMPLEMENTATIONS_V2)} have v2 code)")
 

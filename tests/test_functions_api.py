@@ -1,22 +1,16 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import Base, make_engine
 from app.function_registry import FUNCTION_REGISTRY, reset_function_registry
 from app.main import create_app
 
 
 @pytest.fixture()
-def app(postgres_url, redis_url, rabbitmq_url):
-    engine = make_engine(postgres_url)
-    Base.metadata.create_all(engine)
-    yield create_app(
-        database_url=postgres_url,
-        redis_url=redis_url,
-        rabbitmq_url=rabbitmq_url,
+def app(mongo_url, mongo_db_name, redis_url, rabbitmq_url, vector_store):
+    return create_app(
+        mongodb_url=mongo_url, mongodb_db=mongo_db_name, redis_url=redis_url, rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
     )
-    Base.metadata.drop_all(engine)
-    engine.dispose()
 
 
 @pytest.fixture(autouse=True)
@@ -39,14 +33,11 @@ NEW_FUNCTION = {
 }
 
 
-def test_list_functions_matches_the_seeded_defaults(app, postgres_url):
-    from app.db import make_session_factory
+def test_list_functions_matches_the_seeded_defaults(app, sync_db):
     from app.function_registry import DEFAULT_FUNCTION_REGISTRY
     from dataloadscripts.load_function_registry import upsert_function_registry
 
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        upsert_function_registry(session)
+    upsert_function_registry(sync_db)
 
     with TestClient(app) as client:
         response = client.get("/functions")
@@ -129,3 +120,22 @@ def test_publish_version_rejects_body_name_mismatch(app):
         mismatched["name"] = "a_different_name"
         response = client.post("/functions/test_only_check/versions", json=mismatched)
     assert response.status_code == 422
+
+
+def test_at_most_one_active_version_is_enforced_by_the_database(sync_db):
+    """Stronger than the old app-logic-only invariant: a second 'active'
+    version for the same function can't be written at all."""
+    import pymongo.errors
+
+    from app.models import FunctionDefinition, FunctionDefinitionVersion
+    from dataloadscripts.test_fixtures import insert_docs
+
+    def version(n):
+        return FunctionDefinitionVersion(
+            function_definition_id="f", version_number=n, description="d", params=[], default_retry={},
+            status="active", created_by="t",
+        )
+
+    insert_docs(sync_db, FunctionDefinition(id="f"), version(1))
+    with pytest.raises(pymongo.errors.DuplicateKeyError):
+        insert_docs(sync_db, version(2))

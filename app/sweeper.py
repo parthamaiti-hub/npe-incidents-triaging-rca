@@ -23,39 +23,51 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from aio_pika.abc import AbstractChannel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from pymongo.asynchronous.database import AsyncDatabase
 
-from app.config import SWEEP_INTERVAL_SECONDS, SWEEP_THRESHOLD_MINUTES
-from app.db import make_async_engine, make_async_session_factory
+from app.config import RAG_CLASSIFICATION_RETENTION_MONTHS, SWEEP_INTERVAL_SECONDS, SWEEP_THRESHOLD_MINUTES
+from app.db import ensure_indexes, get_database, make_mongo_client
+from app.embeddings import prune_incident_vectors
 from app.events import declare_incidents_raw, make_channel, make_connection, publish_incident_received
 from app.models import Incident
+from app.repositories.base import find
+from app.vector_store import VectorStore, default_vector_store
 
 logger = logging.getLogger(__name__)
 
 
 async def sweep_once(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     channel: AbstractChannel,
     threshold_minutes: int = SWEEP_THRESHOLD_MINUTES,
 ) -> int:
     """Re-publishes every Incident still "pending" older than
     threshold_minutes. Returns the number swept."""
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=threshold_minutes)
-    async with session_factory() as session:
-        stale = (
-            await session.scalars(
-                select(Incident).where(Incident.classification_status == "pending", Incident.received_at < cutoff)
-            )
-        ).all()
-        for incident in stale:
-            await publish_incident_received(channel, incident.id, incident.raw_text, incident.source)
+    stale = await find(db, Incident, {"classification_status": "pending", "received_at": {"$lt": cutoff}})
+    for incident in stale:
+        await publish_incident_received(channel, incident.id, incident.raw_text, incident.source)
     return len(stale)
 
 
+async def prune_vectors_once(
+    vs: VectorStore, retention_months: int | None = RAG_CLASSIFICATION_RETENTION_MONTHS
+) -> bool:
+    """Chroma doesn't prune itself: drops incident classification vectors
+    older than retention_months (footprints are catalog data, never
+    pruned). A no-op when retention is unset -- the default, which keeps
+    everything, same as before the move to Chroma. Returns whether it ran."""
+    if retention_months is None:
+        return False
+    await prune_incident_vectors(vs, datetime.now(timezone.utc) - timedelta(days=retention_months * 30))
+    return True
+
+
 async def run_sweeper() -> None:
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
+    db = get_database(mongo)
+    await ensure_indexes(db)
+    vs = default_vector_store()
     connection = await make_connection()
     channel = await make_channel(connection)
     await declare_incidents_raw(channel)  # idempotent, same as Base.metadata.create_all
@@ -63,15 +75,19 @@ async def run_sweeper() -> None:
     try:
         while True:
             try:
-                count = await sweep_once(session_factory, channel)
+                count = await sweep_once(db, channel)
                 if count:
                     logger.info("Swept %d stale pending incident(s)", count)
             except Exception:
                 logger.exception("Sweep cycle failed")
+            try:
+                await prune_vectors_once(vs)
+            except Exception:
+                logger.exception("Vector prune failed")
             await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
     finally:
         await connection.close()
-        await engine.dispose()
+        await mongo.close()
 
 
 if __name__ == "__main__":

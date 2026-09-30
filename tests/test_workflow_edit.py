@@ -4,12 +4,11 @@ approve -> version N+1, pin preservation, stale-base conflicts."""
 import pytest
 import yaml
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
-from app.db import Base, make_engine, make_session_factory
 from app.function_registry import FUNCTION_REGISTRY, reset_function_registry
 from app.main import create_app
 from app.models import SourceSystem, WorkflowBuildRequest, WorkflowExecution
+from dataloadscripts.test_fixtures import find_docs, insert_docs
 
 CATEGORY = "FUNCTIONAL DEFECT (QA/UAT)"
 ERROR_LOGS = {"call": "error_logs", "with": {"env": "NPE", "app": "TESTAPP", "lookback_minutes": 240}}
@@ -17,25 +16,23 @@ DEPLOYS = {"call": "recent_deployments", "with": {"env": "NPE", "app": "TESTAPP"
 
 
 @pytest.fixture()
-def app(postgres_url, redis_url, rabbitmq_url):
-    engine = make_engine(postgres_url)
-    Base.metadata.create_all(engine)
-    with make_session_factory(engine)() as session:
-        session.add(
-            SourceSystem(
-                id="SYS_TESTAPP",
-                name="Test App",
-                code="TESTAPP",
-                type="Application",
-                description="x",
-                owning_team="x",
-                environment="NPE",
-            )
-        )
-        session.commit()
-    yield create_app(database_url=postgres_url, redis_url=redis_url, rabbitmq_url=rabbitmq_url)
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def app(sync_db, mongo_url, mongo_db_name, redis_url, rabbitmq_url, vector_store):
+    insert_docs(
+        sync_db,
+        SourceSystem(
+            id="SYS_TESTAPP",
+            name="Test App",
+            code="TESTAPP",
+            type="Application",
+            description="x",
+            owning_team="x",
+            environment="NPE",
+        ),
+    )
+    return create_app(
+        mongodb_url=mongo_url, mongodb_db=mongo_db_name, redis_url=redis_url, rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -96,15 +93,12 @@ def test_render_yaml_converts_draft_tasks(client):
     assert client.post("/workflows/render-yaml", json={"tasks": [{"with": {}}]}).status_code == 422
 
 
-def test_validate_yaml_is_a_dry_run(client, postgres_url):
+def test_validate_yaml_is_a_dry_run(client, sync_db):
     response = client.post("/workflows/validate-yaml", json={"yaml": _yaml_for([ERROR_LOGS])})
     assert response.status_code == 200, response.text
     assert response.json()["tasks"][0]["function_version_number"] == 1
 
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        assert session.scalars(select(WorkflowBuildRequest)).all() == []
-    engine.dispose()
+    assert find_docs(sync_db, WorkflowBuildRequest) == []
 
 
 def test_validate_yaml_syntax_error(client):
@@ -185,17 +179,14 @@ def test_edit_requires_exactly_one_source(client):
     assert _edit(client, v1, yaml=_yaml_for([ERROR_LOGS]), tasks=[ERROR_LOGS]).status_code == 422
 
 
-def test_invalid_edit_saves_nothing(client, postgres_url):
+def test_invalid_edit_saves_nothing(client, sync_db):
     v1 = _publish(client, [ERROR_LOGS])
     bad_syntax = _edit(client, v1, yaml="do: [unclosed\n")
     assert bad_syntax.status_code == 422 and bad_syntax.json()["detail"]["kind"] == "syntax"
     bad_call = _edit(client, v1, yaml=_yaml_for([{"call": "not_real", "with": {}}]))
     assert bad_call.status_code == 422 and bad_call.json()["detail"]["kind"] == "registry"
 
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        assert len(session.scalars(select(WorkflowBuildRequest)).all()) == 1  # only v1's own build
-    engine.dispose()
+    assert len(find_docs(sync_db, WorkflowBuildRequest)) == 1  # only v1's own build
 
 
 def test_edit_of_superseded_base_is_a_conflict(client):
@@ -249,7 +240,7 @@ def test_unchanged_tasks_keep_their_pin_changed_tasks_repin(client):
     assert [t["function_version_number"] for t in preview["tasks"]] == [1, 2, 2]
 
 
-def test_edited_version_executes(client, postgres_url):
+def test_edited_version_executes(client, sync_db):
     v1 = _publish(client, [ERROR_LOGS])
     request = _edit(client, v1, yaml=_yaml_for([ERROR_LOGS, DEPLOYS])).json()
     v2 = client.post(f"/workflows/build-requests/{request['id']}/approve", json={"approved_by": "a"}).json()
@@ -257,7 +248,4 @@ def test_edited_version_executes(client, postgres_url):
     assert run.status_code == 200, run.text
     assert [e["check"] for e in run.json()["evidence"]] == ["error_logs", "recent_deployments"]
 
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        assert session.scalars(select(WorkflowExecution)).first() is not None
-    engine.dispose()
+    assert find_docs(sync_db, WorkflowExecution) != []

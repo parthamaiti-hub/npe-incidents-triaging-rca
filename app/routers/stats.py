@@ -10,11 +10,11 @@ import datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app import rca_status
 from app.classification import MANUAL_TRIAGE
-from app.db import get_async_session
+from app.db import get_db
 from app.incident_dashboard import load_incidents_with_latest_execution
 
 router = APIRouter(prefix="/stats", tags=["stats"])
@@ -35,7 +35,7 @@ class IncidentStatsOut(BaseModel):
 
 
 @router.get("/incidents", response_model=IncidentStatsOut)
-async def incident_stats(period: str = "7d", session: AsyncSession = Depends(get_async_session)):
+async def incident_stats(period: str = "7d", db: AsyncDatabase = Depends(get_db)):
     """`period`: 24h | 7d | 30d | all (default 7d). Filters by the latest
     RCA attempt's started_at -- an incident with no RCA attempt yet
     contributes nothing (these stats are about processing outcomes, not raw
@@ -45,11 +45,11 @@ async def incident_stats(period: str = "7d", session: AsyncSession = Depends(get
         delta = PERIOD_TO_TIMEDELTA.get(period)
         if delta is None:
             delta = PERIOD_TO_TIMEDELTA["7d"]
-        # naive UTC, matching the naive TIMESTAMP columns started_at/completed_at
-        # are stored as (server_default=func.now()) throughout this codebase.
+        # naive UTC, matching how started_at/completed_at are read back
+        # (app.db.make_mongo_client, tz_aware=False) throughout this codebase.
         date_from = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - delta
 
-    rows = await load_incidents_with_latest_execution(session)
+    rows = await load_incidents_with_latest_execution(db)
     processed = [
         r for r in rows if r.latest_execution is not None and (date_from is None or r.latest_execution.started_at >= date_from)
     ]

@@ -5,25 +5,74 @@ pushed to GitHub without carrying data-loading code or catalog paths -- it
 only calls into this module.
 """
 
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
-from sqlalchemy import Engine
+from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.database import Database
 
-from app.db import Base, make_engine, make_session_factory
+from app.db import ensure_indexes_sync, make_mongo_client, make_sync_mongo_client
+from app.models import Document, Incident
+from app.repositories.incidents import insert_incident_sync
 from dataloadscripts.load_catalog import DEFAULT_CATALOG_PATH, load_catalog_file, upsert_catalog
 
 
-def seed_catalog_db(database_url: str, catalog_path: Path = DEFAULT_CATALOG_PATH) -> Engine:
-    """Creates the schema (if needed) and upserts the catalog at
-    catalog_path into database_url. Caller owns teardown:
-    Base.metadata.drop_all(engine); engine.dispose()."""
-    engine = make_engine(database_url)
-    Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-    catalog = load_catalog_file(catalog_path)
-    with session_factory() as session:
-        upsert_catalog(session, catalog)
-    return engine
+def seed_catalog_db(db: Database, catalog_path: Path = DEFAULT_CATALOG_PATH) -> Database:
+    """Creates the indexes (if needed) and upserts the catalog at
+    catalog_path into db. The caller owns the database's teardown."""
+    ensure_indexes_sync(db)
+    upsert_catalog(db, load_catalog_file(catalog_path))
+    return db
+
+
+@contextmanager
+def seeded_catalog_database(mongo_url: str, catalog_path: Path = DEFAULT_CATALOG_PATH) -> Iterator[str]:
+    """A throwaway database with the catalog loaded, for module-scoped
+    fixtures shared by several tests; yields its name, drops it afterwards."""
+    client = make_sync_mongo_client(mongo_url)
+    name = f"t_{uuid.uuid4().hex[:16]}"
+    try:
+        seed_catalog_db(client[name], catalog_path)
+        yield name
+    finally:
+        client.drop_database(name)
+        client.close()
+
+
+@asynccontextmanager
+async def open_db(mongo_url: str, db_name: str) -> AsyncIterator[AsyncDatabase]:
+    """An async handle on a test database. Opened inside the running event
+    loop -- the async client belongs to the loop it was created in."""
+    client = make_mongo_client(mongo_url)
+    try:
+        yield client[db_name]
+    finally:
+        await client.close()
+
+
+def insert_docs(db: Database, *docs: Document) -> None:
+    """Seeds documents in order. Incidents go through the real insert
+    path, so they get their incident_key exactly as the app assigns it."""
+    for doc in docs:
+        if isinstance(doc, Incident):
+            insert_incident_sync(db, doc)
+        else:
+            db[doc.COLLECTION].insert_one(doc.to_doc())
+
+
+def get_doc(db: Database, model: type[Document], id: str):
+    doc = db[model.COLLECTION].find_one({"_id": id})
+    return model.from_doc(doc) if doc is not None else None
+
+
+def find_docs(db: Database, model: type[Document], filter: dict | None = None, sort: list | None = None) -> list:
+    return [model.from_doc(doc) for doc in db[model.COLLECTION].find(filter or {}, sort=sort)]
+
+
+def set_fields(db: Database, model: type[Document], id: str, **fields) -> None:
+    db[model.COLLECTION].update_one({"_id": id}, {"$set": fields})
 
 
 # --- Sample incident texts (tests/test_incident_parser.py) -----------------

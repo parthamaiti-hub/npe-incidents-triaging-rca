@@ -10,15 +10,15 @@ import datetime
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app.classification import apply_classification, classify_raw_text
 from app.config import JIRA_SITE
-from app.db import get_async_session
+from app.db import get_db
 from app.e2e_pipeline import run_e2e_for_jira_key
 from app.incident_dashboard import load_incidents_with_latest_execution
 from app.models import Incident
+from app.repositories.base import find, find_one, get
 from app.routers.workflows import WorkflowExecutionOut
 from app.workflow_orchestrator import WorkflowValidationError, get_version_for_retry, run_rca_for_incident
 
@@ -96,14 +96,14 @@ async def list_incidents(
     offset: int = 0,
     classification_status: str | None = None,
     source_system_id: str | None = None,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
-    stmt = select(Incident).order_by(Incident.received_at.desc()).limit(limit).offset(offset)
+    filter = {}
     if classification_status is not None:
-        stmt = stmt.where(Incident.classification_status == classification_status)
+        filter["classification_status"] = classification_status
     if source_system_id is not None:
-        stmt = stmt.where(Incident.source_system_id == source_system_id)
-    rows = (await session.scalars(stmt)).all()
+        filter["source_system_id"] = source_system_id
+    rows = await find(db, Incident, filter, sort=[("received_at", -1)], skip=offset, limit=limit)
     return [IncidentOut.model_validate(r, from_attributes=True) for r in rows]
 
 
@@ -118,13 +118,13 @@ async def incidents_dashboard(
     category: str | None = None,
     date_from: datetime.datetime | None = None,
     date_to: datetime.datetime | None = None,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
     """One row per incident, newest-processed-first, joined to its latest
     RCA attempt. Registered before /incidents/{incident_id}
     so "dashboard" isn't swallowed as a path parameter."""
     rows = await load_incidents_with_latest_execution(
-        session,
+        db,
         q=q,
         classification_status=classification_status,
         source_system_id=source_system_id,
@@ -158,8 +158,8 @@ async def incidents_dashboard(
 
 
 @router.get("/incidents/{incident_id}", response_model=IncidentOut)
-async def get_incident(incident_id: str, session: AsyncSession = Depends(get_async_session)):
-    row = await session.get(Incident, incident_id)
+async def get_incident(incident_id: str, db: AsyncDatabase = Depends(get_db)):
+    row = await get(db, Incident, incident_id)
     if row is None:
         raise HTTPException(404, f"Incident {incident_id!r} not found")
     return IncidentOut.model_validate(row, from_attributes=True)
@@ -170,23 +170,25 @@ async def trigger_rca(
     jira_key: str,
     request: Request,
     post_comment: bool = False,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
     """Fetches jira_key fresh from Jira Cloud, classifies it, executes its
     active workflow (if any), and returns the synthesized RCA -- the API
     equivalent of `uv run python -m scripts.e2e_rca <jira_key>`. Requires
     JIRA_SITE/JIRA_EMAIL/JIRA_API_TOKEN to be configured. A ticket Jira
     doesn't have is a 404; any other Jira failure is a 502."""
+    # Nothing is written before the Jira fetch, so a Jira failure there
+    # leaves no partial state. (A failed comment post happens after the
+    # execution was recorded -- the same as before, when the RCA run had
+    # already committed by that point too.)
     try:
         result = await run_e2e_for_jira_key(
-            session, request.app.state.http_client, jira_key, jira_site=JIRA_SITE, post_rca_comment=post_comment
+            db, request.app.state.http_client, jira_key, jira_site=JIRA_SITE, post_rca_comment=post_comment
         )
     except httpx.HTTPStatusError as exc:
-        await session.rollback()
         if exc.response.status_code == 404:
             raise HTTPException(404, f"Jira issue {jira_key!r} not found") from exc
         raise HTTPException(502, f"Jira request failed ({exc.response.status_code}) for {jira_key!r}") from exc
-    await session.commit()
     return result
 
 
@@ -194,7 +196,7 @@ async def trigger_rca(
 async def retry_incident(
     incident_key: str,
     payload: RetryRequestIn,
-    session: AsyncSession = Depends(get_async_session),
+    db: AsyncDatabase = Depends(get_db),
 ):
     """Reprocesses an already-ingested incident, found by its incident_key
     (its Jira key, or its generated int_... key). No fresh Jira fetch --
@@ -206,25 +208,24 @@ async def retry_incident(
     version). When there's nothing to run (no playbook / not classified)
     that outcome is recorded rather than rejected. Every retry is its own
     WorkflowExecution row: history is GET /workflows/executions?incident_key=."""
-    incident = (await session.scalars(select(Incident).where(Incident.incident_key == incident_key))).first()
+    incident = await find_one(db, Incident, {"incident_key": incident_key})
     if incident is None:
         raise HTTPException(404, f"No ingested incident with key {incident_key!r}")
 
     version = None
     if payload.workflow_definition_version_id is not None:
         try:
-            version = await get_version_for_retry(session, payload.workflow_definition_version_id)
+            version = await get_version_for_retry(db, payload.workflow_definition_version_id)
         except WorkflowValidationError as exc:
             raise HTTPException(422, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(404, str(exc)) from exc
 
-    classification = await classify_raw_text(session, incident.raw_text)
-    apply_classification(incident, classification)
-    await session.flush()
+    classification = await classify_raw_text(db, incident.raw_text)
+    await apply_classification(db, incident, classification)
 
     execution = await run_rca_for_incident(
-        session,
+        db,
         incident,
         triggered_by="retry",
         version=version,

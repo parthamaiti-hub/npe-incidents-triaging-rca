@@ -1,6 +1,10 @@
 """Idempotently load the NPE triage catalog (teams, environments, source
 systems, footprints, mapping rules, RCA playbooks) from a YAML file into
-Postgres.
+MongoDB.
+
+With LLM_FALLBACK_ENABLED, also embeds any footprint that has no vector yet
+(scripts/rebuild_vector_index.py --only footprints --missing), the corpus
+LLM fallback classification retrieves from.
 
 Usage:
     uv run python -m dataloadscripts.load_catalog --file dataloadscripts/source_systems.yaml
@@ -10,11 +14,11 @@ import argparse
 from pathlib import Path
 
 import yaml
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.checks import has_implementation
-from app.db import Base, make_engine, make_session_factory
+from app.config import LLM_FALLBACK_ENABLED
+from app.db import ensure_indexes_sync, get_database, make_sync_mongo_client
 from app.function_registry import FUNCTION_REGISTRY
 from app.models import (
     Environment,
@@ -65,20 +69,16 @@ def _validate_fk_integrity(catalog: CatalogIn) -> None:
             )
 
 
-def upsert_catalog(session: Session, catalog: CatalogIn) -> None:
-    """Upsert every row by primary key. Safe to call repeatedly."""
-    _validate_fk_integrity(catalog)
+def _merge(db: Database, obj, session) -> None:
+    """Upsert by primary key -- what session.merge() used to do."""
+    doc = obj.to_doc()
+    db[obj.COLLECTION].replace_one({"_id": doc["_id"]}, doc, upsert=True, session=session)
 
-    for item in catalog.teams:
-        session.merge(Team(**item.model_dump()))
-    for item in catalog.environments:
-        session.merge(Environment(**item.model_dump()))
-    for item in catalog.source_systems:
-        session.merge(SourceSystem(**item.model_dump()))
-    for item in catalog.system_footprints:
-        session.merge(SystemFootprint(**item.model_dump()))
-    for item in catalog.incident_mapping_rules:
-        session.merge(IncidentMappingRule(**item.model_dump()))
+
+def _compile_playbooks(catalog: CatalogIn) -> list[tuple]:
+    """Validates and pins every playbook's tasks up front, so a bad
+    playbook fails the load before anything is written."""
+    compiled = []
     for item in catalog.rca_playbooks:
         tasks = []
         for step in item.steps:
@@ -101,29 +101,47 @@ def upsert_catalog(session: Session, catalog: CatalogIn) -> None:
             task.function_version_id = spec.version_id
             task.function_version_number = version_number
             tasks.append(task.model_dump(by_alias=True, exclude_none=True))
+        compiled.append((item, tasks))
+    return compiled
 
-        session.merge(
-            WorkflowDefinition(id=item.id, source_system_id=item.source_system_id, category=item.category)
-        )
-        session.flush()
 
-        latest = (
-            session.scalars(
-                select(WorkflowDefinitionVersion)
-                .where(WorkflowDefinitionVersion.workflow_definition_id == item.id)
-                .order_by(WorkflowDefinitionVersion.version_number.desc())
+def upsert_catalog(db: Database, catalog: CatalogIn) -> None:
+    """Upsert every document by primary key, all in one transaction. Safe
+    to call repeatedly."""
+    _validate_fk_integrity(catalog)
+    playbooks = _compile_playbooks(catalog)
+
+    def load(session) -> None:
+        for item in catalog.teams:
+            _merge(db, Team(**item.model_dump()), session)
+        for item in catalog.environments:
+            _merge(db, Environment(**item.model_dump()), session)
+        for item in catalog.source_systems:
+            _merge(db, SourceSystem(**item.model_dump()), session)
+        for item in catalog.system_footprints:
+            _merge(db, SystemFootprint(**item.model_dump()), session)
+        for item in catalog.incident_mapping_rules:
+            _merge(db, IncidentMappingRule(**item.model_dump()), session)
+        for item, tasks in playbooks:
+            _merge(db, WorkflowDefinition(id=item.id, source_system_id=item.source_system_id, category=item.category), session)
+
+            latest_doc = db[WorkflowDefinitionVersion.COLLECTION].find_one(
+                {"workflow_definition_id": item.id}, sort=[("version_number", -1)], session=session
             )
-        ).first()
+            latest = WorkflowDefinitionVersion.from_doc(latest_doc) if latest_doc is not None else None
 
-        if latest is not None and latest.document == tasks:
-            continue  # unchanged since last load -- idempotent, no new version
+            if latest is not None and latest.document == tasks:
+                continue  # unchanged since last load -- idempotent, no new version
 
-        next_version_number = (latest.version_number if latest else 0) + 1
-        if latest is not None and latest.status == "approved":
-            latest.status = "superseded"
-
-        session.add(
-            WorkflowDefinitionVersion(
+            next_version_number = (latest.version_number if latest else 0) + 1
+            # Supersede whatever is approved before inserting the new
+            # approved version (one approved per definition, index-enforced).
+            db[WorkflowDefinitionVersion.COLLECTION].update_many(
+                {"workflow_definition_id": item.id, "status": "approved"},
+                {"$set": {"status": "superseded"}},
+                session=session,
+            )
+            version = WorkflowDefinitionVersion(
                 id=f"{item.id}_v{next_version_number}",
                 workflow_definition_id=item.id,
                 version_number=next_version_number,
@@ -132,9 +150,10 @@ def upsert_catalog(session: Session, catalog: CatalogIn) -> None:
                 source="static_authored",
                 created_by="catalog_loader",
             )
-        )
+            db[WorkflowDefinitionVersion.COLLECTION].insert_one(version.to_doc(), session=session)
 
-    session.commit()
+    with db.client.start_session() as session:
+        session.with_transaction(load)
 
 
 def main() -> None:
@@ -144,12 +163,13 @@ def main() -> None:
 
     catalog = load_catalog_file(args.file)
 
-    engine = make_engine()
-    Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-
-    with session_factory() as session:
-        upsert_catalog(session, catalog)
+    client = make_sync_mongo_client()
+    try:
+        db = get_database(client)
+        ensure_indexes_sync(db)
+        upsert_catalog(db, catalog)
+    finally:
+        client.close()
 
     print(
         f"Loaded {len(catalog.teams)} teams, "
@@ -159,6 +179,11 @@ def main() -> None:
         f"{len(catalog.incident_mapping_rules)} mapping rules, "
         f"{len(catalog.rca_playbooks)} playbooks from {args.file}"
     )
+
+    if LLM_FALLBACK_ENABLED:
+        from scripts.rebuild_vector_index import rebuild_sync
+
+        print(rebuild_sync(only=["footprints"], missing=True))
 
 
 if __name__ == "__main__":

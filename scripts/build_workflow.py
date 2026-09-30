@@ -20,7 +20,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from app.db import make_async_engine, make_async_session_factory
+from app.db import get_database, make_mongo_client
 from app.workflow_orchestrator import WorkflowValidationError, approve_build_request, build_workflow_from_request
 
 
@@ -34,32 +34,31 @@ async def run(
 ) -> None:
     requested_functions = json.loads(functions_path.read_text())
 
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
+    db = get_database(mongo)
     try:
-        async with session_factory() as session:
-            request = await build_workflow_from_request(
-                session,
-                source_system_id,
-                category,
-                requested_functions,
-                requested_by,
-                use_case_description,
-            )
-            print(f"Build request {request.id} rendered for ({source_system_id}, {category}):")
-            print(json.dumps(request.generated_document, indent=2))
+        request = await build_workflow_from_request(
+            db,
+            source_system_id,
+            category,
+            requested_functions,
+            requested_by,
+            use_case_description,
+        )
+        print(f"Build request {request.id} rendered for ({source_system_id}, {category}):")
+        print(json.dumps(request.generated_document, indent=2))
 
-            if do_approve:
-                version = await approve_build_request(session, request.id, approved_by=requested_by)
-                print(
-                    f"\nApproved as WorkflowDefinitionVersion {version.id} "
-                    f"(version_number={version.version_number}) -- now the active workflow "
-                    f"for ({source_system_id}, {category})."
-                )
-            else:
-                print(f"\nNot approved yet. Approve with: --approve (build_request_id={request.id})")
+        if do_approve:
+            version = await approve_build_request(db, request.id, approved_by=requested_by)
+            print(
+                f"\nApproved as WorkflowDefinitionVersion {version.id} "
+                f"(version_number={version.version_number}) -- now the active workflow "
+                f"for ({source_system_id}, {category})."
+            )
+        else:
+            print(f"\nNot approved yet. Approve with: --approve (build_request_id={request.id})")
     finally:
-        await engine.dispose()
+        await mongo.close()
 
 
 def main() -> None:

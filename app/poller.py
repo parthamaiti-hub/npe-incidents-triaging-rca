@@ -16,9 +16,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from aio_pika.abc import AbstractChannel
+from pymongo.asynchronous.client_session import AsyncClientSession
+from pymongo.asynchronous.database import AsyncDatabase
 from redis.asyncio import Redis
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import (
     JIRA_SITE,
@@ -28,7 +28,7 @@ from app.config import (
     TEAMS_CHANNEL_ID,
     TEAMS_TEAM_ID,
 )
-from app.db import make_async_engine, make_async_session_factory
+from app.db import ensure_indexes, get_database, in_transaction, make_mongo_client
 from app.events import declare_incidents_raw, make_channel, make_connection, publish_incident_received
 from app.graph_client import acquire_token, extract_jira_keys, get_channel_messages, message_author, message_text
 from app.idempotency import make_redis
@@ -36,6 +36,8 @@ from app.incident_parser import extract_application_id_hint, extract_error_syste
 from app.jira_client import parse_issue, search_issues
 from app.models import Incident
 from app.reference_data import resolve_addressed_team, resolve_environment
+from app.repositories.base import find_one, update_fields
+from app.repositories.incidents import insert_incident
 
 logger = logging.getLogger(__name__)
 
@@ -71,63 +73,66 @@ def _collect_jira_mentions(messages: list[dict]) -> dict[str, list[dict]]:
     return mentions
 
 
-async def upsert_incident_from_jira(session, issue: dict, mentions: list[dict]) -> Incident:
+async def upsert_incident_from_jira(
+    db: AsyncDatabase, issue: dict, mentions: list[dict], session: AsyncClientSession | None = None
+) -> Incident:
+    """Creates the incident for this Jira issue, or refreshes the Jira-owned
+    fields of the existing one. Only those fields are written -- never a
+    whole-document replace -- so a concurrent classification write by the
+    worker can't be clobbered by this refresh."""
     parsed = parse_issue(issue)
     raw_text = f"Subject: {parsed['summary']}\nBody:\n{parsed['description_text']}"
 
-    incident = (
-        await session.scalars(select(Incident).where(Incident.jira_key == parsed["jira_key"]))
-    ).first()
+    incident = await find_one(db, Incident, {"jira_key": parsed["jira_key"]}, session=session)
 
-    if incident is None:
-        incident = Incident(
-            source="jira",
-            external_id=parsed["jira_key"],
-            jira_key=parsed["jira_key"],
-            raw_text=raw_text,
-            teams_mentions=[],
-        )
-        session.add(incident)
-
-    incident.raw_text = raw_text
-    incident.subject = parsed["summary"]
-    incident.status = parsed["status"]
-    incident.priority = parsed["priority"]
-    incident.issue_type = parsed["issue_type"]
-    incident.reporter = parsed["reporter"]
-    incident.assignee = parsed["assignee"]
-    incident.labels = parsed["labels"]
-    incident.resolution = parsed["resolution"]
-    incident.created = parsed["created"]
-    incident.updated = parsed["updated"]
-
-    existing_mentions = list(incident.teams_mentions or [])
+    existing_mentions = list(incident.teams_mentions or []) if incident is not None else []
     for mention in mentions:
         if mention not in existing_mentions:
             existing_mentions.append(mention)
-    incident.teams_mentions = existing_mentions
-    incident.related_jira_keys = [k for m in existing_mentions for k in extract_jira_keys(m.get("text", "")) if k != incident.jira_key] or None
 
     # addressed_team lives in the Teams discussion ("Hi dpo-dice, ..."), not
     # in the Jira issue's own summary/description -- resolve it from the
     # mention text specifically, not raw_text.
     mentions_text = "\n".join(m.get("text", "") for m in existing_mentions)
 
-    environment = await resolve_environment(session, raw_text)
-    addressed_team = await resolve_addressed_team(session, mentions_text or raw_text)
-    incident.environment_raw = environment.code if environment else None
-    incident.environment_id = environment.id if environment else None
-    incident.application_id_hint = extract_application_id_hint(raw_text)
-    incident.error_system_hint = extract_error_system_hint(raw_text)
-    incident.addressed_team_raw = addressed_team.teams_handle if addressed_team else None
-    incident.addressed_team_id = addressed_team.id if addressed_team else None
+    environment = await resolve_environment(db, raw_text)
+    addressed_team = await resolve_addressed_team(db, mentions_text or raw_text)
 
-    await session.flush()
+    fields = {
+        "raw_text": raw_text,
+        "subject": parsed["summary"],
+        "status": parsed["status"],
+        "priority": parsed["priority"],
+        "issue_type": parsed["issue_type"],
+        "reporter": parsed["reporter"],
+        "assignee": parsed["assignee"],
+        "labels": parsed["labels"],
+        "resolution": parsed["resolution"],
+        "created": parsed["created"],
+        "updated": parsed["updated"],
+        "teams_mentions": existing_mentions,
+        "related_jira_keys": [
+            k for m in existing_mentions for k in extract_jira_keys(m.get("text", "")) if k != parsed["jira_key"]
+        ]
+        or None,
+        "environment_raw": environment.code if environment else None,
+        "environment_id": environment.id if environment else None,
+        "application_id_hint": extract_application_id_hint(raw_text),
+        "error_system_hint": extract_error_system_hint(raw_text),
+        "addressed_team_raw": addressed_team.teams_handle if addressed_team else None,
+        "addressed_team_id": addressed_team.id if addressed_team else None,
+    }
+
+    if incident is None:
+        incident = Incident(source="jira", external_id=parsed["jira_key"], jira_key=parsed["jira_key"], **fields)
+        return await insert_incident(db, incident, session=session)
+
+    await update_fields(db, incident, fields, session=session)
     return incident
 
 
 async def poll_once(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     channel: AbstractChannel,
     redis: Redis,
     http_client: httpx.AsyncClient,
@@ -155,16 +160,19 @@ async def poll_once(
 
     # A1: publish only after the transaction commits -- upsert_incident_from_jira
     # no longer publishes itself. Publishing per-issue *inside* this loop (the
-    # old behavior) meant a worker could consume a message for an Incident row
+    # old behavior) meant a worker could consume a message for an Incident
     # that didn't exist yet, or -- worse -- never would, if a later issue in
     # this same batch failed and rolled the whole transaction back. Collecting
     # here and publishing after commit closes that race outright.
-    to_publish: list[tuple[str, str, str]] = []
-    async with session_factory() as session:
+    async def upsert_batch(session) -> list[tuple[str, str, str]]:
+        # Built inside the callback: with_transaction may re-run it.
+        batch = []
         for issue in issues:
-            incident = await upsert_incident_from_jira(session, issue, mentions_by_key.get(issue["key"], []))
-            to_publish.append((incident.id, incident.raw_text, "jira"))
-        await session.commit()
+            incident = await upsert_incident_from_jira(db, issue, mentions_by_key.get(issue["key"], []), session=session)
+            batch.append((incident.id, incident.raw_text, "jira"))
+        return batch
+
+    to_publish = await in_transaction(db, upsert_batch)
 
     for incident_id, raw_text, source in to_publish:
         await publish_incident_received(channel, incident_id, raw_text, source)
@@ -174,8 +182,9 @@ async def poll_once(
 
 
 async def run_poller() -> None:
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
+    db = get_database(mongo)
+    await ensure_indexes(db)
     redis = make_redis()
     connection = await make_connection()
     channel = await make_channel(connection)
@@ -193,7 +202,7 @@ async def run_poller() -> None:
                     # I/O) -- offloaded to a thread so it doesn't stall the event
                     # loop the way calling it inline would.
                     access_token = await asyncio.to_thread(acquire_token)
-                    count = await poll_once(session_factory, channel, redis, http_client, access_token)
+                    count = await poll_once(db, channel, redis, http_client, access_token)
                     logger.info("Poll cycle upserted %d incidents", count)
                     consecutive_failures = 0
                     await asyncio.sleep(POLL_INTERVAL_SECONDS * random.uniform(0.9, 1.1))
@@ -210,7 +219,7 @@ async def run_poller() -> None:
     finally:
         await connection.close()
         await redis.aclose()
-        await engine.dispose()
+        await mongo.close()
 
 
 if __name__ == "__main__":

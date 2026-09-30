@@ -5,10 +5,17 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 
-from app.config import CORS_ALLOWED_ORIGINS, DATABASE_URL, RABBITMQ_URL, REDIS_URL
-from app.db import make_async_engine, make_async_session_factory
+from app.config import (
+    CORS_ALLOWED_ORIGINS,
+    LLM_FALLBACK_ENABLED,
+    MONGODB_DB,
+    MONGODB_URL,
+    RABBITMQ_URL,
+    RCA_SYNTHESIS_LLM_ENABLED,
+    REDIS_URL,
+)
+from app.db import ensure_indexes, get_database, make_mongo_client
 from app.events import declare_incidents_raw, make_channel, make_connection
 from app.function_registry import refresh_function_registry_from_db
 from app.idempotency import make_redis
@@ -17,30 +24,40 @@ from app.routers.functions import router as functions_router
 from app.routers.incidents import router as incidents_router
 from app.routers.stats import router as stats_router
 from app.routers.workflows import router as workflows_router
+from app.vector_store import VectorStore, default_vector_store
 from app.webhooks import router as webhooks_router
 
 
+def _vector_store_required() -> bool:
+    """Chroma sits only on the LLM/RAG paths; the deterministic pipeline
+    must stay healthy without it."""
+    return LLM_FALLBACK_ENABLED or RCA_SYNTHESIS_LLM_ENABLED
+
+
 def create_app(
-    database_url: str = DATABASE_URL,
+    mongodb_url: str = MONGODB_URL,
+    mongodb_db: str = MONGODB_DB,
     redis_url: str = REDIS_URL,
     rabbitmq_url: str = RABBITMQ_URL,
+    vector_store: VectorStore | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        engine = make_async_engine(database_url)
-        app.state.session_factory = make_async_session_factory(engine)
+        app.state.mongo = make_mongo_client(mongodb_url)
+        app.state.db = get_database(app.state.mongo, mongodb_db)
+        app.state.vector_store = vector_store or default_vector_store()
         app.state.redis = make_redis(redis_url)
         app.state.rabbitmq_connection = await make_connection(rabbitmq_url)
         app.state.rabbitmq_channel = await make_channel(app.state.rabbitmq_connection)
-        await declare_incidents_raw(app.state.rabbitmq_channel)  # idempotent, same as Base.metadata.create_all
+        await declare_incidents_raw(app.state.rabbitmq_channel)  # idempotent, same as ensure_indexes
         app.state.http_client = httpx.AsyncClient(timeout=15.0)
         try:
-            async with app.state.session_factory() as session:
-                await refresh_function_registry_from_db(session)
+            await ensure_indexes(app.state.db)
+            await refresh_function_registry_from_db(app.state.db)
         except Exception:
-            # function_definition table may not exist yet on a fresh/
-            # unmigrated DB -- FUNCTION_REGISTRY keeps its built-in
-            # defaults, which is exactly the fallback it's designed for.
+            # MongoDB unreachable at startup -- FUNCTION_REGISTRY keeps its
+            # built-in defaults (exactly the fallback it's designed for), and
+            # /health reports the database as down.
             pass
         try:
             yield
@@ -48,7 +65,7 @@ def create_app(
             await app.state.http_client.aclose()
             await app.state.rabbitmq_connection.close()
             await app.state.redis.aclose()
-            await engine.dispose()
+            await app.state.mongo.close()
 
     app = FastAPI(title="NPE Incident Triage", lifespan=lifespan)
     if CORS_ALLOWED_ORIGINS:
@@ -69,13 +86,15 @@ def create_app(
     async def health(request: Request) -> JSONResponse:
         """Actually exercises each dependency (not just "is the process
         listening") -- a 200 from /docs only proves FastAPI itself is up,
-        not that the DB/Redis/RabbitMQ connections this app needs are live."""
+        not that the DB/Redis/RabbitMQ connections this app needs are live.
+
+        The vector store (Chroma) is always reported, but only fails the
+        check when an LLM feature that reads it is enabled."""
         checks: dict[str, str] = {}
         healthy = True
 
         try:
-            async with request.app.state.session_factory() as session:
-                await session.execute(text("SELECT 1"))
+            await request.app.state.db.command("ping")
             checks["database"] = "ok"
         except Exception as exc:
             checks["database"] = f"error: {exc}"
@@ -97,6 +116,16 @@ def create_app(
         except Exception as exc:
             checks["rabbitmq"] = f"error: {exc}"
             healthy = False
+
+        try:
+            await request.app.state.vector_store.heartbeat()
+            checks["vector_store"] = "ok"
+        except Exception as exc:
+            if _vector_store_required():
+                checks["vector_store"] = f"error: {exc}"
+                healthy = False
+            else:
+                checks["vector_store"] = f"unavailable (not required, LLM features off): {exc}"
 
         return JSONResponse(
             status_code=200 if healthy else 503,

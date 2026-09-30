@@ -2,14 +2,12 @@ import re
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
 
-from app.db import Base, make_engine, make_session_factory
 from app.incident_parser import extract_signals
 from app.models import Environment, SourceSystem, SystemFootprint, Team
 from app.opa_client import evaluate_mapping_rules
 from dataloadscripts.load_catalog import load_catalog_file, upsert_catalog
-from dataloadscripts.test_fixtures import REAL_TICKET_FIBER, REAL_TICKET_IDS
+from dataloadscripts.test_fixtures import REAL_TICKET_FIBER, REAL_TICKET_IDS, get_doc
 
 REAL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "dataloadscripts" / "npe_real_source_systems.yaml"
 
@@ -17,15 +15,6 @@ REAL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "dataloadscripts" / "n
 @pytest.fixture()
 def real_catalog():
     return load_catalog_file(REAL_CATALOG_PATH)
-
-
-@pytest.fixture()
-def session_factory(postgres_url):
-    engine = make_engine(postgres_url)
-    Base.metadata.create_all(engine)
-    yield make_session_factory(engine)
-    Base.metadata.drop_all(engine)
-    engine.dispose()
 
 
 def test_real_catalog_row_counts(real_catalog):
@@ -53,21 +42,19 @@ def test_real_catalog_no_playbook_category_is_any(real_catalog):
         assert rule.category != "ANY"
 
 
-def test_real_catalog_loads_into_postgres(session_factory, real_catalog):
-    with session_factory() as session:
-        upsert_catalog(session, real_catalog)
+def test_real_catalog_loads_into_mongodb(sync_db, real_catalog):
+    upsert_catalog(sync_db, real_catalog)
 
-        assert session.scalar(select(func.count()).select_from(Team)) == 4
-        assert session.scalar(select(func.count()).select_from(Environment)) == 10
-        assert session.scalar(select(func.count()).select_from(SourceSystem)) == 23
-        assert session.scalar(select(func.count()).select_from(SystemFootprint)) > 0
+    assert sync_db[Team.COLLECTION].count_documents({}) == 4
+    assert sync_db[Environment.COLLECTION].count_documents({}) == 10
+    assert sync_db[SourceSystem.COLLECTION].count_documents({}) == 23
+    assert sync_db[SystemFootprint.COLLECTION].count_documents({}) > 0
 
 
-def test_real_catalog_qlab03_environment_has_qla03_alias(session_factory, real_catalog):
-    with session_factory() as session:
-        upsert_catalog(session, real_catalog)
-        env = session.get(Environment, "ENV_QLAB03")
-        assert env.aliases == "QLA03"
+def test_real_catalog_qlab03_environment_has_qla03_alias(sync_db, real_catalog):
+    upsert_catalog(sync_db, real_catalog)
+    env = get_doc(sync_db, Environment, "ENV_QLAB03")
+    assert env.aliases == "QLA03"
 
 
 async def test_real_fiber_ticket_resolves_to_fiber_system(opa_url, monkeypatch):

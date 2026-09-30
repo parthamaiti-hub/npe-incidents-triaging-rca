@@ -15,27 +15,24 @@ Usage:
     uv run python -m dataloadscripts.load_function_registry
 """
 
-import uuid
+from pymongo.database import Database
 
-from sqlalchemy.orm import Session
-
-from app.db import Base, make_engine, make_session_factory
+from app.db import ensure_indexes_sync, get_database, make_sync_mongo_client
 from app.function_registry import DEFAULT_FUNCTION_REGISTRY, FunctionSpec
 from app.models import FunctionDefinition, FunctionDefinitionVersion
 
 
-def upsert_function_registry(session: Session, entries: dict[str, FunctionSpec] | None = None) -> int:
+def upsert_function_registry(db: Database, entries: dict[str, FunctionSpec] | None = None) -> int:
     """Returns how many functions were newly created."""
     entries = entries if entries is not None else DEFAULT_FUNCTION_REGISTRY
-    created = 0
-    for name, spec in entries.items():
-        if session.get(FunctionDefinition, name) is not None:
-            continue
-        session.add(FunctionDefinition(id=name))
-        session.flush()
-        session.add(
-            FunctionDefinitionVersion(
-                id=str(uuid.uuid4()),
+
+    def seed(session) -> int:
+        count = 0
+        for name, spec in entries.items():
+            if db[FunctionDefinition.COLLECTION].find_one({"_id": name}, session=session) is not None:
+                continue
+            db[FunctionDefinition.COLLECTION].insert_one(FunctionDefinition(id=name).to_doc(), session=session)
+            version = FunctionDefinitionVersion(
                 function_definition_id=name,
                 version_number=1,
                 description=spec.description,
@@ -44,19 +41,22 @@ def upsert_function_registry(session: Session, entries: dict[str, FunctionSpec] 
                 status="active",
                 created_by="seed_script",
             )
-        )
-        created += 1
-    session.commit()
-    return created
+            db[FunctionDefinitionVersion.COLLECTION].insert_one(version.to_doc(), session=session)
+            count += 1
+        return count
+
+    with db.client.start_session() as session:
+        return session.with_transaction(seed)
 
 
 def main() -> None:
-    engine = make_engine()
-    Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-
-    with session_factory() as session:
-        created = upsert_function_registry(session)
+    client = make_sync_mongo_client()
+    try:
+        db = get_database(client)
+        ensure_indexes_sync(db)
+        created = upsert_function_registry(db)
+    finally:
+        client.close()
 
     print(f"Created {created} new function definitions ({len(DEFAULT_FUNCTION_REGISTRY) - created} already existed)")
 

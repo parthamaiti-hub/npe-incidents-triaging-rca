@@ -7,7 +7,7 @@ key directly.
 """
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app.adf_report import build_rca_comment_adf
 from app.classification import apply_classification, classify_raw_text
@@ -18,7 +18,7 @@ from app.workflow_orchestrator import run_rca_for_incident
 
 
 async def run_e2e_for_jira_key(
-    session: AsyncSession,
+    db: AsyncDatabase,
     http_client: httpx.AsyncClient,
     jira_key: str,
     jira_site: str = JIRA_SITE,
@@ -30,16 +30,15 @@ async def run_e2e_for_jira_key(
     issue = {**issue, "key": jira_key}
     parsed = parse_issue(issue)
 
-    # Every RCA attempt gets an Incident row (created, or refreshed from Jira)
-    # -- the dashboard and Retry tab are built from Incident rows, so an
+    # Every RCA attempt gets an Incident (created, or refreshed from Jira)
+    # -- the dashboard and Retry tab are built from Incidents, so an
     # execution without one would be invisible there.
-    incident = await upsert_incident_from_jira(session, issue, mentions=[])
+    incident = await upsert_incident_from_jira(db, issue, mentions=[])
 
-    classification = await classify_raw_text(session, incident.raw_text)
-    apply_classification(incident, classification)
-    await session.flush()
+    classification = await classify_raw_text(db, incident.raw_text)
+    await apply_classification(db, incident, classification)
 
-    execution = await run_rca_for_incident(session, incident, triggered_by="rca")
+    execution = await run_rca_for_incident(db, incident, triggered_by="rca")
     result: dict = {
         "jira_key": jira_key,
         "incident_key": incident.incident_key,

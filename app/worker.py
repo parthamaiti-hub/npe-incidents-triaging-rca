@@ -19,16 +19,17 @@ import logging
 
 from aio_pika.abc import AbstractIncomingMessage
 from openai import AsyncOpenAI
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app.classification import FULLY_CLASSIFIED_STATUSES, apply_classification, classify_raw_text
 from app.config import LLM_FALLBACK_ENABLED
-from app.db import make_async_engine, make_async_session_factory
-from app.embeddings import embed_resolved_incident
+from app.db import ensure_indexes, get_database, make_mongo_client
+from app.embeddings import embed_resolved_incident, incident_is_embedded
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
 from app.llm_client import make_openai_client
-from app.models import ClassificationEmbedding, Incident, WorkflowExecution
+from app.models import Incident, WorkflowExecution
+from app.repositories.base import exists, get
+from app.vector_store import VectorStore, default_vector_store
 from app.workflow_orchestrator import run_rca_for_incident
 
 logger = logging.getLogger(__name__)
@@ -48,90 +49,76 @@ class IncidentNotFoundError(Exception):
 
 
 async def process_message(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     payload: dict,
     openai_client: AsyncOpenAI | None = None,
+    vs: VectorStore | None = None,
 ) -> None:
-    async with session_factory() as session:
-        incident = await session.get(Incident, payload["incident_id"])
-        if incident is None:
-            raise IncidentNotFoundError(payload["incident_id"])
+    incident = await get(db, Incident, payload["incident_id"])
+    if incident is None:
+        raise IncidentNotFoundError(payload["incident_id"])
 
-        result = await classify_raw_text(session, payload["raw_text"], client=openai_client)
-        apply_classification(incident, result)
+    result = await classify_raw_text(db, payload["raw_text"], client=openai_client, vs=vs)
 
-        # Classification commits on its own here -- embedding no
-        # longer shares this transaction (see _embed_incident_best_effort
-        # below). It used to run inline in this same `async with` block, so
-        # an OpenAI hiccup rolled back a classification that had already
-        # succeeded, and every one of process_with_retry's retries re-ran
-        # the whole thing, inserting a duplicate ClassificationEmbedding row
-        # each time it got further than the failure point.
-        await session.commit()
-        incident_id = incident.id
-        status = result["status"]
+    # Classification is persisted on its own here -- embedding is a
+    # separate, later write (see _embed_incident_best_effort below). It
+    # used to share one transaction with classification, so an OpenAI
+    # hiccup rolled back a classification that had already succeeded, and
+    # every one of process_with_retry's retries re-ran the whole thing.
+    await apply_classification(db, incident, result)
 
-    if LLM_FALLBACK_ENABLED and status in FULLY_CLASSIFIED_STATUSES:
-        await _embed_incident_best_effort(session_factory, openai_client, incident_id)
+    if LLM_FALLBACK_ENABLED and result["status"] in FULLY_CLASSIFIED_STATUSES:
+        await _embed_incident_best_effort(db, openai_client, incident.id, vs)
 
-    await _auto_rca_best_effort(session_factory, incident_id)
+    await _auto_rca_best_effort(db, incident.id)
 
 
-async def _auto_rca_best_effort(session_factory: async_sessionmaker, incident_id: str) -> None:
-    """The incident's first RCA, right after classification. Runs in its own
-    transaction after classification has committed; a failure is logged and
-    swallowed (the execution row records it), never re-raised into
-    process_with_retry. Skipped if an automatic RCA already exists for this
-    incident, so a redelivered message doesn't run it twice."""
+async def _auto_rca_best_effort(db: AsyncDatabase, incident_id: str) -> None:
+    """The incident's first RCA, right after classification has been
+    persisted; a failure is logged and swallowed (the execution document
+    records it), never re-raised into process_with_retry. Skipped if an
+    automatic RCA already exists for this incident, so a redelivered message
+    doesn't run it twice."""
     try:
-        async with session_factory() as session:
-            already = await session.scalar(
-                select(WorkflowExecution.id).where(
-                    WorkflowExecution.incident_id == incident_id, WorkflowExecution.triggered_by == "auto"
-                )
-            )
-            if already is not None:
-                return
-            incident = await session.get(Incident, incident_id)
-            if incident is None:
-                return
-            await run_rca_for_incident(session, incident, triggered_by="auto")
+        if await exists(db, WorkflowExecution, {"incident_id": incident_id, "triggered_by": "auto"}):
+            return
+        incident = await get(db, Incident, incident_id)
+        if incident is None:
+            return
+        await run_rca_for_incident(db, incident, triggered_by="auto")
     except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
         logger.warning("Automatic RCA failed for incident %s: %s", incident_id, exc)
 
 
 async def _embed_incident_best_effort(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     openai_client: AsyncOpenAI | None,
     incident_id: str,
+    vs: VectorStore | None = None,
 ) -> None:
     """A non-essential enhancement (the RAG corpus) must never fail
-    the message that already durably classified this incident. Runs in its
-    own transaction, after classification has committed; any failure here
-    (OpenAI outage, etc.) is logged and swallowed, never re-raised -- so it
-    never triggers process_with_retry's retry/DLQ path. The existence check
-    (backed by the partial unique index on ClassificationEmbedding) makes a
-    redelivered/retried embed attempt a no-op instead of inserting a
-    duplicate row."""
+    the message that already durably classified this incident. Runs after
+    classification has been persisted; any failure here (OpenAI or Chroma
+    outage, etc.) is logged and swallowed, never re-raised -- so it never
+    triggers process_with_retry's retry/DLQ path. The vector id is
+    deterministic (incident:<id>) and written with upsert, so a redelivered
+    message can't duplicate it; the existence check just avoids paying for
+    a second OpenAI embedding call."""
+    vs = vs or default_vector_store()
     try:
-        async with session_factory() as session:
-            already = await session.scalar(
-                select(ClassificationEmbedding.id).where(ClassificationEmbedding.incident_id == incident_id)
-            )
-            if already is not None:
-                return
-            incident = await session.get(Incident, incident_id)
-            if incident is None:
-                return
-            client = openai_client or make_openai_client()
-            await embed_resolved_incident(session, client, incident)
-            await session.commit()
+        if await incident_is_embedded(vs, incident_id):
+            return
+        incident = await get(db, Incident, incident_id)
+        if incident is None:
+            return
+        client = openai_client or make_openai_client()
+        await embed_resolved_incident(vs, client, incident)
     except Exception as exc:  # noqa: BLE001 -- deliberately swallowed, see docstring
-        logger.warning("Embedding failed for incident %s (classification already committed): %s", incident_id, exc)
+        logger.warning("Embedding failed for incident %s (classification already persisted): %s", incident_id, exc)
 
 
 async def process_with_retry(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     payload: dict,
     openai_client: AsyncOpenAI | None = None,
     max_attempts: int = MAX_ATTEMPTS,
@@ -144,7 +131,7 @@ async def process_with_retry(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            await process_message(session_factory, payload, openai_client)
+            await process_message(db, payload, openai_client)
             return True
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see app.playbook_engine
             last_error = exc
@@ -169,7 +156,7 @@ async def process_with_retry(
 
 async def handle_message(
     message: AbstractIncomingMessage,
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     openai_client: AsyncOpenAI | None = None,
 ) -> None:
     """Both decode() and process_with_retry are guarded here: an unguarded
@@ -185,7 +172,7 @@ async def handle_message(
         return
 
     try:
-        succeeded = await process_with_retry(session_factory, payload, openai_client)
+        succeeded = await process_with_retry(db, payload, openai_client)
     except Exception as exc:  # noqa: BLE001 -- backstop; process_with_retry already catches internally
         logger.error("Unexpected error handling message, dead-lettering: %s", exc)
         await message.nack(requeue=False)
@@ -202,8 +189,9 @@ async def run_worker() -> None:
     channel = await make_channel(connection)
     queue = await declare_incidents_raw(channel)
 
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
+    db = get_database(mongo)
+    await ensure_indexes(db)
     openai_client = make_openai_client()  # construction is lazy/local -- no network call until first use
 
     try:
@@ -212,10 +200,10 @@ async def run_worker() -> None:
                 message = await consume_one(iterator, timeout=None)
                 if message is None:
                     continue
-                await handle_message(message, session_factory, openai_client)
+                await handle_message(message, db, openai_client)
     finally:
         await connection.close()
-        await engine.dispose()
+        await mongo.close()
 
 
 if __name__ == "__main__":

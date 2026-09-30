@@ -1,24 +1,23 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import Base, make_engine, make_session_factory
 from app.main import create_app
-from app.models import WorkflowExecution
+from app.models import RcaPatternType, WorkflowExecution
+from dataloadscripts.test_fixtures import insert_docs
 
 
 @pytest.fixture()
-def app(postgres_url, redis_url, rabbitmq_url):
-    engine = make_engine(postgres_url)
-    Base.metadata.create_all(engine)
-    yield create_app(database_url=postgres_url, redis_url=redis_url, rabbitmq_url=rabbitmq_url)
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def app(mongo_url, mongo_db_name, redis_url, rabbitmq_url, vector_store):
+    return create_app(
+        mongodb_url=mongo_url, mongodb_db=mongo_db_name, redis_url=redis_url, rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
+    )
 
 
-def _seed_execution(postgres_url) -> str:
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        execution = WorkflowExecution(
+def _seed_execution(db) -> str:
+    insert_docs(
+        db,
+        WorkflowExecution(
             id="EXEC-1",
             workflow_definition_version_id=None,
             document_snapshot=[],
@@ -27,15 +26,13 @@ def _seed_execution(postgres_url) -> str:
             rca_status="Inconclusive",
             triggered_by="rca",
             status="completed",
-        )
-        session.add(execution)
-        session.commit()
-    engine.dispose()
+        ),
+    )
     return "EXEC-1"
 
 
-def test_post_and_list_feedback(app, postgres_url):
-    execution_id = _seed_execution(postgres_url)
+def test_post_and_list_feedback(app, sync_db):
+    execution_id = _seed_execution(sync_db)
     with TestClient(app) as client:
         first = client.post(
             f"/workflows/executions/{execution_id}/feedback",
@@ -67,11 +64,34 @@ def test_feedback_against_unknown_execution_404s(app):
     assert response.status_code == 404
 
 
-def test_feedback_confidence_score_out_of_range_rejected(app, postgres_url):
-    execution_id = _seed_execution(postgres_url)
+def test_feedback_confidence_score_out_of_range_rejected(app, sync_db):
+    execution_id = _seed_execution(sync_db)
     with TestClient(app) as client:
         response = client.post(
             f"/workflows/executions/{execution_id}/feedback",
             json={"comment": "x", "confidence_score": 6, "given_by": "alice"},
         )
     assert response.status_code == 422
+
+
+def test_feedback_with_unknown_corrected_pattern_rejected(app, sync_db):
+    """What the rca_pattern_type foreign key used to refuse is now an
+    explicit check."""
+    execution_id = _seed_execution(sync_db)
+    insert_docs(
+        sync_db,
+        RcaPatternType(id="environment_config", description="d", max_rca_status="Probable", created_by="t"),
+    )
+    with TestClient(app) as client:
+        unknown = client.post(
+            f"/workflows/executions/{execution_id}/feedback",
+            json={"confidence_score": 2, "given_by": "alice", "corrected_pattern_id": "no_such_pattern"},
+        )
+        known = client.post(
+            f"/workflows/executions/{execution_id}/feedback",
+            json={"confidence_score": 2, "given_by": "alice", "corrected_pattern_id": "environment_config"},
+        )
+
+    assert unknown.status_code == 422
+    assert known.status_code == 201, known.text
+    assert known.json()["corrected_pattern_id"] == "environment_config"

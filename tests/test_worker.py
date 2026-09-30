@@ -5,20 +5,20 @@ import uuid
 import aio_pika
 import pytest
 
-from app.db import make_async_engine, make_async_session_factory
 from app.events import consume_one, decode, make_channel, make_connection
 from app.worker import handle_message, process_with_retry
+from dataloadscripts.test_fixtures import open_db
 
 
 def test_process_with_retry_returns_true_on_success(monkeypatch):
     calls = []
 
-    async def ok(session_factory, payload, openai_client=None):
+    async def ok(db, payload, openai_client=None):
         calls.append(payload)
 
     monkeypatch.setattr("app.worker.process_message", ok)
 
-    result = asyncio.run(process_with_retry(session_factory=None, payload={"incident_id": "x"}, max_attempts=3))
+    result = asyncio.run(process_with_retry(db=None, payload={"incident_id": "x"}, max_attempts=3))
 
     assert result is True
     assert calls == [{"incident_id": "x"}]
@@ -27,7 +27,7 @@ def test_process_with_retry_returns_true_on_success(monkeypatch):
 def test_process_with_retry_returns_false_after_exhausting_attempts(monkeypatch):
     attempts = []
 
-    async def always_fails(session_factory, payload, openai_client=None):
+    async def always_fails(db, payload, openai_client=None):
         attempts.append(payload)
         raise RuntimeError("boom")
 
@@ -37,7 +37,7 @@ def test_process_with_retry_returns_false_after_exhausting_attempts(monkeypatch)
     monkeypatch.setattr("app.worker.process_message", always_fails)
     monkeypatch.setattr("app.worker.asyncio.sleep", no_sleep)
 
-    result = asyncio.run(process_with_retry(session_factory=None, payload={"incident_id": "x"}, max_attempts=3))
+    result = asyncio.run(process_with_retry(db=None, payload={"incident_id": "x"}, max_attempts=3))
 
     assert result is False
     assert len(attempts) == 3
@@ -64,15 +64,13 @@ async def _declare_isolated_dead_letter_queue(channel):
     return queue, dlq
 
 
-def test_worker_dead_letters_message_after_exhausting_retries(postgres_url, rabbitmq_url):
+def test_worker_dead_letters_message_after_exhausting_retries(mongo_url, mongo_db_name, rabbitmq_url):
     """Publishes a payload missing "incident_id" -- process_message raises
     KeyError on every attempt -- runs it through process_with_retry exactly
     as run_worker() does, nacks with requeue=False on exhaustion, and
     confirms RabbitMQ's dead-letter-exchange actually routes it to the DLQ."""
 
     async def _run():
-        engine = make_async_engine(postgres_url)
-        session_factory = make_async_session_factory(engine)
         connection = await make_connection(rabbitmq_url)
         channel = await make_channel(connection)
         queue, dlq = await _declare_isolated_dead_letter_queue(channel)
@@ -83,11 +81,11 @@ def test_worker_dead_letters_message_after_exhausting_retries(postgres_url, rabb
                 routing_key=queue.name,
             )
 
-            async with queue.iterator() as iterator:
+            async with open_db(mongo_url, mongo_db_name) as db, queue.iterator() as iterator:
                 message = await consume_one(iterator, timeout=20.0)
                 assert message is not None, "expected the published message on the isolated test queue"
                 payload = decode(message)
-                succeeded = await process_with_retry(session_factory, payload, max_attempts=1)
+                succeeded = await process_with_retry(db, payload, max_attempts=1)
                 assert succeeded is False
                 await message.nack(requeue=False)
 
@@ -98,12 +96,11 @@ def test_worker_dead_letters_message_after_exhausting_retries(postgres_url, rabb
                 await dlq_message.ack()
         finally:
             await connection.close()
-            await engine.dispose()
 
     asyncio.run(_run())
 
 
-def test_worker_dead_letters_message_referencing_missing_incident(postgres_url, rabbitmq_url):
+def test_worker_dead_letters_message_referencing_missing_incident(mongo_url, mongo_db_name, rabbitmq_url):
     """A message whose incident_id doesn't exist in the DB used to be acked
     (silent permanent loss -- just a warning log). process_message now
     raises IncidentNotFoundError instead, so process_with_retry's existing
@@ -111,8 +108,6 @@ def test_worker_dead_letters_message_referencing_missing_incident(postgres_url, 
     retries, then dead-letter -- not a fresh ack-on-missing-work default."""
 
     async def _run():
-        engine = make_async_engine(postgres_url)
-        session_factory = make_async_session_factory(engine)
         connection = await make_connection(rabbitmq_url)
         channel = await make_channel(connection)
         queue, dlq = await _declare_isolated_dead_letter_queue(channel)
@@ -127,11 +122,11 @@ def test_worker_dead_letters_message_referencing_missing_incident(postgres_url, 
                 routing_key=queue.name,
             )
 
-            async with queue.iterator() as iterator:
+            async with open_db(mongo_url, mongo_db_name) as db, queue.iterator() as iterator:
                 message = await consume_one(iterator, timeout=20.0)
                 assert message is not None
                 payload = decode(message)
-                succeeded = await process_with_retry(session_factory, payload, max_attempts=2)
+                succeeded = await process_with_retry(db, payload, max_attempts=2)
                 assert succeeded is False
                 await message.nack(requeue=False)
 
@@ -142,12 +137,11 @@ def test_worker_dead_letters_message_referencing_missing_incident(postgres_url, 
                 await dlq_message.ack()
         finally:
             await connection.close()
-            await engine.dispose()
 
     asyncio.run(_run())
 
 
-def test_handle_message_nacks_undecodable_body_without_raising(postgres_url, rabbitmq_url):
+def test_handle_message_nacks_undecodable_body_without_raising(mongo_url, mongo_db_name, rabbitmq_url):
     """An unguarded decode exception would propagate out of run_worker's
     loop entirely, through the `finally`, killing the whole worker process
     over one poison message. handle_message wraps decode in its own
@@ -156,8 +150,6 @@ def test_handle_message_nacks_undecodable_body_without_raising(postgres_url, rab
     consuming."""
 
     async def _run():
-        engine = make_async_engine(postgres_url)
-        session_factory = make_async_session_factory(engine)
         connection = await make_connection(rabbitmq_url)
         channel = await make_channel(connection)
         queue, dlq = await _declare_isolated_dead_letter_queue(channel)
@@ -167,10 +159,10 @@ def test_handle_message_nacks_undecodable_body_without_raising(postgres_url, rab
                 routing_key=queue.name,
             )
 
-            async with queue.iterator() as iterator:
+            async with open_db(mongo_url, mongo_db_name) as db, queue.iterator() as iterator:
                 message = await consume_one(iterator, timeout=20.0)
                 assert message is not None
-                await handle_message(message, session_factory)  # must not raise
+                await handle_message(message, db)  # must not raise
 
             async with dlq.iterator() as dlq_iterator:
                 dlq_message = await consume_one(dlq_iterator, timeout=20.0)
@@ -179,6 +171,5 @@ def test_handle_message_nacks_undecodable_body_without_raising(postgres_url, rab
                 await dlq_message.ack()
         finally:
             await connection.close()
-            await engine.dispose()
 
     asyncio.run(_run())

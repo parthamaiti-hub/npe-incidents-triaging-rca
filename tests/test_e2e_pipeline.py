@@ -5,13 +5,12 @@ import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
-from sqlalchemy import select
 
-from app.db import Base, make_async_engine, make_async_session_factory
 from app.e2e_pipeline import run_e2e_for_jira_key
 from app.main import create_app
 from app.models import Incident, WorkflowExecution
-from dataloadscripts.test_fixtures import JIRA_ISSUE_RS_173234, seed_catalog_db
+from app.repositories.base import find
+from dataloadscripts.test_fixtures import JIRA_ISSUE_RS_173234, open_db, seeded_catalog_database
 
 REAL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "dataloadscripts" / "npe_real_source_systems.yaml"
 
@@ -42,15 +41,13 @@ JIRA_ISSUE_IDS = {
 
 
 @pytest.fixture(scope="module")
-def real_catalog_db(postgres_url):
-    engine = seed_catalog_db(postgres_url, catalog_path=REAL_CATALOG_PATH)
-    yield postgres_url
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def real_catalog_db(mongo_url):
+    with seeded_catalog_database(mongo_url, REAL_CATALOG_PATH) as name:
+        yield name
 
 
 @respx.mock
-async def test_e2e_fiber_ticket_produces_functional_defect_rca(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_fiber_ticket_produces_functional_defect_rca(real_catalog_db, mongo_url, opa_url, monkeypatch):
     import app.opa_client as opa_client_module
 
     monkeypatch.setattr(opa_client_module, "OPA_URL", opa_url)
@@ -59,13 +56,8 @@ async def test_e2e_fiber_ticket_produces_functional_defect_rca(real_catalog_db, 
         return_value=httpx.Response(200, json=JIRA_ISSUE_RS_173234)
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
-    try:
-        async with session_factory() as session, httpx.AsyncClient() as client:
-            result = await run_e2e_for_jira_key(session, client, "TT-9001", jira_site="npetriage.atlassian.net")
-    finally:
-        await engine.dispose()
+    async with open_db(mongo_url, real_catalog_db) as db, httpx.AsyncClient() as client:
+        result = await run_e2e_for_jira_key(db, client, "TT-9001", jira_site="npetriage.atlassian.net")
 
     print(f"\n[OUTCOME] {result}")
 
@@ -83,7 +75,7 @@ async def test_e2e_fiber_ticket_produces_functional_defect_rca(real_catalog_db, 
 
 
 @respx.mock
-async def test_e2e_ids_ticket_produces_data_quality_rca(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_ids_ticket_produces_data_quality_rca(real_catalog_db, mongo_url, opa_url, monkeypatch):
     import app.opa_client as opa_client_module
 
     monkeypatch.setattr(opa_client_module, "OPA_URL", opa_url)
@@ -92,13 +84,8 @@ async def test_e2e_ids_ticket_produces_data_quality_rca(real_catalog_db, opa_url
         return_value=httpx.Response(200, json=JIRA_ISSUE_IDS)
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
-    try:
-        async with session_factory() as session, httpx.AsyncClient() as client:
-            result = await run_e2e_for_jira_key(session, client, "TT-9002", jira_site="npetriage.atlassian.net")
-    finally:
-        await engine.dispose()
+    async with open_db(mongo_url, real_catalog_db) as db, httpx.AsyncClient() as client:
+        result = await run_e2e_for_jira_key(db, client, "TT-9002", jira_site="npetriage.atlassian.net")
 
     print(f"\n[OUTCOME] {result}")
 
@@ -110,7 +97,7 @@ async def test_e2e_ids_ticket_produces_data_quality_rca(real_catalog_db, opa_url
 
 
 @respx.mock
-async def test_e2e_reports_no_playbook_when_none_configured(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_reports_no_playbook_when_none_configured(real_catalog_db, mongo_url, opa_url, monkeypatch):
     """Most real systems have no playbook yet -- confirms this is reported
     honestly, not silently faked."""
     import app.opa_client as opa_client_module
@@ -138,13 +125,8 @@ async def test_e2e_reports_no_playbook_when_none_configured(real_catalog_db, opa
         return_value=httpx.Response(200, json=no_playbook_issue)
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
-    try:
-        async with session_factory() as session, httpx.AsyncClient() as client:
-            result = await run_e2e_for_jira_key(session, client, "TT-9003", jira_site="npetriage.atlassian.net")
-    finally:
-        await engine.dispose()
+    async with open_db(mongo_url, real_catalog_db) as db, httpx.AsyncClient() as client:
+        result = await run_e2e_for_jira_key(db, client, "TT-9003", jira_site="npetriage.atlassian.net")
 
     print(f"\n[OUTCOME] {result}")
 
@@ -155,7 +137,7 @@ async def test_e2e_reports_no_playbook_when_none_configured(real_catalog_db, opa
 
 
 @respx.mock
-async def test_e2e_creates_and_links_an_incident_row_for_the_requested_key(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_creates_and_links_an_incident_row_for_the_requested_key(real_catalog_db, mongo_url, opa_url, monkeypatch):
     """An /rca run must leave an Incident row (the dashboard and Retry tab
     are built from them), keyed on the requested key and linked to every
     execution -- and a second run refreshes that row, never duplicates it."""
@@ -167,21 +149,13 @@ async def test_e2e_creates_and_links_an_incident_row_for_the_requested_key(real_
         return_value=httpx.Response(200, json=JIRA_ISSUE_RS_173234)  # payload's own key differs on purpose
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
-    try:
+    async with open_db(mongo_url, real_catalog_db) as db:
         for _ in range(2):
-            async with session_factory() as session, httpx.AsyncClient() as client:
-                await run_e2e_for_jira_key(session, client, "TT-9005", jira_site="npetriage.atlassian.net")
-                await session.commit()
+            async with httpx.AsyncClient() as client:
+                await run_e2e_for_jira_key(db, client, "TT-9005", jira_site="npetriage.atlassian.net")
 
-        async with session_factory() as session:
-            incidents = (await session.scalars(select(Incident).where(Incident.jira_key == "TT-9005"))).all()
-            executions = (
-                await session.scalars(select(WorkflowExecution).where(WorkflowExecution.jira_key == "TT-9005"))
-            ).all()
-    finally:
-        await engine.dispose()
+        incidents = await find(db, Incident, {"jira_key": "TT-9005"})
+        executions = await find(db, WorkflowExecution, {"jira_key": "TT-9005"})
 
     assert len(incidents) == 1
     incident = incidents[0]
@@ -194,7 +168,7 @@ async def test_e2e_creates_and_links_an_incident_row_for_the_requested_key(real_
 
 
 @respx.mock
-async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db, opa_url, monkeypatch):
+async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db, mongo_url, opa_url, monkeypatch):
     import app.opa_client as opa_client_module
     import app.workflow_orchestrator as orchestrator_module
 
@@ -211,15 +185,10 @@ async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db,
         return_value=httpx.Response(201, json={"id": "99001"})
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
-    try:
-        async with session_factory() as session, httpx.AsyncClient() as client:
-            result = await run_e2e_for_jira_key(
-                session, client, "TT-9004", jira_site="npetriage.atlassian.net", post_rca_comment=True
-            )
-    finally:
-        await engine.dispose()
+    async with open_db(mongo_url, real_catalog_db) as db, httpx.AsyncClient() as client:
+        result = await run_e2e_for_jira_key(
+            db, client, "TT-9004", jira_site="npetriage.atlassian.net", post_rca_comment=True
+        )
 
     print(f"\n[OUTCOME] {result}")
 
@@ -231,7 +200,9 @@ async def test_e2e_post_rca_comment_posts_adf_body_to_the_issue(real_catalog_db,
 
 
 @respx.mock
-def test_rca_endpoint_returns_404_for_a_ticket_jira_does_not_have(real_catalog_db, redis_url, rabbitmq_url, monkeypatch):
+def test_rca_endpoint_returns_404_for_a_ticket_jira_does_not_have(
+    real_catalog_db, mongo_url, redis_url, rabbitmq_url, vector_store, monkeypatch
+):
     import app.routers.incidents as incidents_router
 
     monkeypatch.setattr(incidents_router, "JIRA_SITE", "npetriage.atlassian.net")
@@ -239,7 +210,10 @@ def test_rca_endpoint_returns_404_for_a_ticket_jira_does_not_have(real_catalog_d
     respx.route(host="127.0.0.1").pass_through()
     respx.get("https://npetriage.atlassian.net/rest/api/3/issue/TT-404").mock(return_value=httpx.Response(404, json={}))
 
-    app = create_app(database_url=real_catalog_db, redis_url=redis_url, rabbitmq_url=rabbitmq_url)
+    app = create_app(
+        mongodb_url=mongo_url, mongodb_db=real_catalog_db, redis_url=redis_url, rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
+    )
     with TestClient(app) as client:
         response = client.post("/rca/TT-404")
 

@@ -183,18 +183,15 @@ def reset_function_registry(entries: dict[str, FunctionSpec]) -> None:
     FUNCTION_REGISTRY.update(entries)
 
 
-async def refresh_function_registry_from_db(session) -> None:
+async def refresh_function_registry_from_db(db) -> None:
     """Reloads FUNCTION_REGISTRY from each function's *active*
     FunctionDefinitionVersion. A no-op if there are no active versions
-    (table not seeded yet) -- keeps the built-in defaults rather than
+    (collection not seeded yet) -- keeps the built-in defaults rather than
     wiping them, so an unseeded DB doesn't break validation."""
-    from sqlalchemy import select
-
     from app.models import FunctionDefinitionVersion
+    from app.repositories.base import find
 
-    rows = (
-        await session.scalars(select(FunctionDefinitionVersion).where(FunctionDefinitionVersion.status == "active"))
-    ).all()
+    rows = await find(db, FunctionDefinitionVersion, {"status": "active"})
     if not rows:
         return
     reset_function_registry(

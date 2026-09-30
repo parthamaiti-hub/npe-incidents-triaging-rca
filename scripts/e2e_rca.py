@@ -16,20 +16,17 @@ import asyncio
 import httpx
 
 from app import classification_status
-from app.db import make_async_engine, make_async_session_factory
+from app.db import get_database, make_mongo_client
 from app.e2e_pipeline import run_e2e_for_jira_key
 
 
 async def run(jira_key: str, post_rca_comment: bool) -> dict:
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
     try:
-        async with session_factory() as session, httpx.AsyncClient(timeout=15.0) as client:
-            result = await run_e2e_for_jira_key(session, client, jira_key, post_rca_comment=post_rca_comment)
-            await session.commit()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await run_e2e_for_jira_key(get_database(mongo), client, jira_key, post_rca_comment=post_rca_comment)
     finally:
-        await engine.dispose()
-    return result
+        await mongo.close()
 
 
 def print_report(result: dict) -> None:

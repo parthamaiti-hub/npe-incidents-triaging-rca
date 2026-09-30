@@ -14,10 +14,10 @@ Usage:
     uv run python -m dataloadscripts.seed_rca_pattern_types
 """
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app import rca_status
-from app.db import Base, make_engine, make_session_factory
+from app.db import ensure_indexes_sync, get_database, make_sync_mongo_client
 from app.models import RcaPatternType
 
 SEED_CREATED_BY = "rca_pattern_type_seed"
@@ -51,26 +51,27 @@ DEFAULT_PATTERNS: list[dict] = [
 ]
 
 
-def seed_default_patterns(session: Session) -> int:
-    """Returns how many new RcaPatternType rows were inserted (existing
-    rows are left untouched, not re-seeded)."""
+def seed_default_patterns(db: Database) -> int:
+    """Returns how many new RcaPatternType documents were inserted
+    (existing ones are left untouched, not re-seeded)."""
     inserted = 0
     for pattern in DEFAULT_PATTERNS:
-        if session.get(RcaPatternType, pattern["id"]) is not None:
-            continue
-        session.add(RcaPatternType(created_by=SEED_CREATED_BY, status="active", **pattern))
-        inserted += 1
-    session.commit()
+        # $setOnInsert: an existing pattern (maybe with a deliberately
+        # raised ceiling) is never overwritten.
+        doc = RcaPatternType(created_by=SEED_CREATED_BY, status="active", **pattern).to_doc()
+        result = db[RcaPatternType.COLLECTION].update_one({"_id": doc["_id"]}, {"$setOnInsert": doc}, upsert=True)
+        inserted += result.upserted_id is not None
     return inserted
 
 
 def main() -> None:
-    engine = make_engine()
-    Base.metadata.create_all(engine)
-    session_factory = make_session_factory(engine)
-
-    with session_factory() as session:
-        inserted = seed_default_patterns(session)
+    client = make_sync_mongo_client()
+    try:
+        db = get_database(client)
+        ensure_indexes_sync(db)
+        inserted = seed_default_patterns(db)
+    finally:
+        client.close()
 
     print(f"Seeded {inserted} new RCA_PATTERN_TYPE rows ({len(DEFAULT_PATTERNS)} in the default set)")
 

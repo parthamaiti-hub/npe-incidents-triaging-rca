@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Starts the full NPE Incident Triage stack: docker-compose services
-    (postgres/valkey/rabbitmq/opa), then the FastAPI API, classification
+    (mongo/chroma/valkey/rabbitmq/opa), then the FastAPI API, classification
     worker, Teams/Jira poller, RCA worker, and pending-incident
     sweeper as local uv-managed background processes.
 
@@ -63,14 +63,19 @@ Write-Host "==> docker compose up -d"
 docker compose up -d
 if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
 
-Write-Host "==> waiting for postgres to be healthy"
-$pgContainer = docker compose ps -q postgres
-$deadline = (Get-Date).AddSeconds(60)
-while ($true) {
-    $status = docker inspect --format='{{.State.Health.Status}}' $pgContainer 2>$null
-    if ($status -eq "healthy") { break }
-    if ((Get-Date) -gt $deadline) { throw "postgres did not become healthy within 60s -- check docker compose logs postgres" }
-    Start-Sleep -Seconds 2
+# mongo's healthcheck also initiates its single-node replica set on first
+# start, so "healthy" means transactions are available. chroma is only
+# needed by the LLM/RAG paths, but it's cheap to wait for too.
+foreach ($service in @("mongo", "chroma")) {
+    Write-Host "==> waiting for $service to be healthy"
+    $container = docker compose ps -q $service
+    $deadline = (Get-Date).AddSeconds(90)
+    while ($true) {
+        $status = docker inspect --format='{{.State.Health.Status}}' $container 2>$null
+        if ($status -eq "healthy") { break }
+        if ((Get-Date) -gt $deadline) { throw "$service did not become healthy within 90s -- check docker compose logs $service" }
+        Start-Sleep -Seconds 2
+    }
 }
 
 if (-not $SkipCatalogLoad) {

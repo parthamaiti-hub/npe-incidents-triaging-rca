@@ -15,14 +15,15 @@ import datetime
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app import rca_status
 from app.config import OPENAI_MODEL
-from app.embeddings import retrieve_feedback_context
+from app.embeddings import FeedbackContext, retrieve_feedback_context
 from app.llm_client import structured_completion
-from app.models import FeedbackEmbedding, RcaPatternType
+from app.models import RcaPatternType
+from app.repositories.base import find
+from app.vector_store import VectorStore, default_vector_store
 
 # Sentinel returned when evidence fits no cataloged pattern -- queues the
 # case for human review rather than letting the LLM invent a label.
@@ -60,7 +61,7 @@ def _format_evidence(evidence: list[dict]) -> str:
     return "\n".join(f"- [{e['status']}] {e['check']}: {e['details']}" for e in evidence)
 
 
-def _format_retrieved(retrieved: list[FeedbackEmbedding]) -> str:
+def _format_retrieved(retrieved: list[FeedbackContext]) -> str:
     if not retrieved:
         return "(no similar historical feedback found)"
     # Prompt-injection guardrail: this text is untrusted,
@@ -88,7 +89,7 @@ def _build_system_prompt(pattern_catalog: dict[str, RcaPatternType]) -> str:
     )
 
 
-def _build_user_prompt(evidence_text: str, operator_context: str | None, retrieved: list[FeedbackEmbedding]) -> str:
+def _build_user_prompt(evidence_text: str, operator_context: str | None, retrieved: list[FeedbackContext]) -> str:
     return (
         f"Evidence from this run's diagnostic checks:\n{evidence_text}\n\n"
         f"Operator-supplied context (human input, a hint, not ground truth):\n"
@@ -98,20 +99,21 @@ def _build_user_prompt(evidence_text: str, operator_context: str | None, retriev
 
 
 async def synthesize_rca_via_llm(
-    session: AsyncSession,
+    db: AsyncDatabase,
     client: AsyncOpenAI,
     evidence: list[dict],
     operator_context: str | None = None,
+    vs: VectorStore | None = None,
 ) -> dict:
     """Only ever called for non-correlated executions with real evidence to
     reason over -- app.rca_worker's job to guard that; no_playbook/
     not_classified outcomes (empty evidence) are handled deterministically
     upstream and never reach this module either."""
-    patterns = (await session.scalars(select(RcaPatternType).where(RcaPatternType.status == "active"))).all()
+    patterns = await find(db, RcaPatternType, {"status": "active"})
     pattern_catalog = {p.id: p for p in patterns}
 
     evidence_text = _format_evidence(evidence)
-    retrieved = await retrieve_feedback_context(session, client, evidence_text)
+    retrieved = await retrieve_feedback_context(vs or default_vector_store(), client, evidence_text)
 
     suggestion = await structured_completion(
         client,

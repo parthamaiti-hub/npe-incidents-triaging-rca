@@ -1,4 +1,4 @@
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app.incident_parser import (
     extract_application_id_hint,
@@ -7,15 +7,14 @@ from app.incident_parser import (
 )
 from app.models import Incident
 from app.reference_data import resolve_addressed_team, resolve_environment
+from app.repositories.incidents import insert_incident
 
 
-async def create_incident_record(
-    session: AsyncSession, source: str, external_id: str, raw_text: str
-) -> Incident:
+async def create_incident_record(db: AsyncDatabase, source: str, external_id: str, raw_text: str) -> Incident:
     subject = parse_template(raw_text)["subject"]
 
-    environment = await resolve_environment(session, raw_text)
-    addressed_team = await resolve_addressed_team(session, raw_text)
+    environment = await resolve_environment(db, raw_text)
+    addressed_team = await resolve_addressed_team(db, raw_text)
 
     incident = Incident(
         source=source,
@@ -38,6 +37,4 @@ async def create_incident_record(
         addressed_team_raw=addressed_team.teams_handle if addressed_team else None,
         addressed_team_id=addressed_team.id if addressed_team else None,
     )
-    session.add(incident)
-    await session.flush()
-    return incident
+    return await insert_incident(db, incident)

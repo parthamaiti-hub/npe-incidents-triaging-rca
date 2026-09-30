@@ -2,22 +2,22 @@
 dashboard endpoint (app.routers.incidents) and the stats endpoint
 (app.routers.stats).
 
-Implemented as two plain queries plus an in-Python group-by rather than a
-correlated-subquery/window-function join: this is a dev-scale table (the
+Implemented as two plain queries plus an in-Python group-by rather than an
+aggregation-pipeline $lookup: this is a dev-scale collection (the
 NPE-triage volume this tool targets is nowhere near needing that), and a
-straightforward version is far less risky to get right than hand-written
-window-function SQL with no existing precedent elsewhere in this codebase.
-Revisit with a real SQL join if/when incident volume actually makes this a
+straightforward version is far less risky to get right. Revisit with an
+aggregation pipeline if/when incident volume actually makes this a
 bottleneck.
 """
 
 import datetime
+import re
 from dataclasses import dataclass
 
-from sqlalchemy import or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from pymongo.asynchronous.database import AsyncDatabase
 
 from app.models import Incident, WorkflowExecution
+from app.repositories.base import find
 
 
 @dataclass
@@ -27,7 +27,7 @@ class IncidentWithLatestExecution:
 
 
 async def load_incidents_with_latest_execution(
-    session: AsyncSession,
+    db: AsyncDatabase,
     *,
     q: str | None = None,
     classification_status: str | None = None,
@@ -40,39 +40,37 @@ async def load_incidents_with_latest_execution(
     recent WorkflowExecution (by started_at), if any. Executions are matched
     by incident_id when present, falling back to jira_key for rows that
     only recorded jira_key."""
-    stmt = select(Incident)
+    filter: dict = {}
     if classification_status is not None:
-        stmt = stmt.where(Incident.classification_status == classification_status)
+        filter["classification_status"] = classification_status
     if source_system_id is not None:
-        stmt = stmt.where(Incident.source_system_id == source_system_id)
+        filter["source_system_id"] = source_system_id
     if category is not None:
-        stmt = stmt.where(Incident.category == category)
+        filter["category"] = category
+    received_at = {}
     if date_from is not None:
-        stmt = stmt.where(Incident.received_at >= date_from)
+        received_at["$gte"] = date_from
     if date_to is not None:
-        stmt = stmt.where(Incident.received_at <= date_to)
+        received_at["$lte"] = date_to
+    if received_at:
+        filter["received_at"] = received_at
     if q:
-        pattern = f"%{q}%"
-        stmt = stmt.where(
-            or_(Incident.incident_key.ilike(pattern), Incident.jira_key.ilike(pattern), Incident.subject.ilike(pattern))
-        )
+        # Escaped: user input is a literal substring (ILIKE '%q%'), never a
+        # regex pattern -- unescaped it would be an injection/ReDoS vector.
+        pattern = {"$regex": re.escape(q), "$options": "i"}
+        filter["$or"] = [{"incident_key": pattern}, {"jira_key": pattern}, {"subject": pattern}]
 
-    incidents = (await session.scalars(stmt)).all()
+    incidents = await find(db, Incident, filter)
     if not incidents:
         return []
 
     incident_ids = [i.id for i in incidents]
     jira_keys = [i.jira_key for i in incidents if i.jira_key is not None]
 
-    exec_filters = [WorkflowExecution.incident_id.in_(incident_ids)]
+    exec_filters: list[dict] = [{"incident_id": {"$in": incident_ids}}]
     if jira_keys:
-        exec_filters.append(WorkflowExecution.jira_key.in_(jira_keys))
-    exec_stmt = (
-        select(WorkflowExecution)
-        .where(or_(*exec_filters))
-        .order_by(WorkflowExecution.started_at.desc())
-    )
-    executions = (await session.scalars(exec_stmt)).all()
+        exec_filters.append({"jira_key": {"$in": jira_keys}})
+    executions = await find(db, WorkflowExecution, {"$or": exec_filters}, sort=[("started_at", -1)])
 
     latest_by_incident_id: dict[str, WorkflowExecution] = {}
     latest_by_jira_key: dict[str, WorkflowExecution] = {}

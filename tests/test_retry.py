@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import Base, make_engine, make_session_factory
 from app.main import create_app
 from app.models import Incident, SourceSystem, WorkflowDefinition, WorkflowDefinitionVersion
+from dataloadscripts.test_fixtures import insert_docs, set_fields
 
 CATEGORY = "FUNCTIONAL DEFECT (QA/UAT)"
 
@@ -29,12 +29,11 @@ MANUAL_TRIAGE = {
 
 
 @pytest.fixture()
-def app(postgres_url, redis_url, rabbitmq_url):
-    engine = make_engine(postgres_url)
-    Base.metadata.create_all(engine)
-    yield create_app(database_url=postgres_url, redis_url=redis_url, rabbitmq_url=rabbitmq_url)
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def app(mongo_url, mongo_db_name, redis_url, rabbitmq_url, vector_store):
+    return create_app(
+        mongodb_url=mongo_url, mongodb_db=mongo_db_name, redis_url=redis_url, rabbitmq_url=rabbitmq_url,
+        vector_store=vector_store,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -49,70 +48,57 @@ def classifier(monkeypatch):
     return mock
 
 
-def _seed(postgres_url):
+def _seed(db):
     """One incident whose active workflow is v2; v1 is superseded (still
     retryable) and v3 is a draft (never vetted, not retryable)."""
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        session.add(
-            SourceSystem(
-                id="SYS_X", name="X", code="X", type="Application", description="x", owning_team="x", environment="NPE"
-            )
-        )
-        session.flush()
-        session.add(
-            Incident(
-                id="INC-1",
-                source="jira",
-                external_id="TT-1",
-                raw_text="x",
-                jira_key="TT-1",
-                classification_status="resolved",
-                source_system_id="SYS_X",
-                category=CATEGORY,
-            )
-        )
-        session.add(WorkflowDefinition(id="WFD_X", source_system_id="SYS_X", category=CATEGORY))
-        session.flush()
-        session.add(
-            WorkflowDefinitionVersion(
-                id="WFDV_V1",
-                workflow_definition_id="WFD_X",
-                version_number=1,
-                document=[{"call": "error_logs", "with": {"env": "NPE", "app": "X", "lookback_minutes": 60}}],
-                status="superseded",
-                source="static_authored",
-                created_by="test",
-            )
-        )
-        session.add(
-            WorkflowDefinitionVersion(
-                id="WFDV_V2",
-                workflow_definition_id="WFD_X",
-                version_number=2,
-                document=[{"call": "error_logs", "with": {"env": "NPE", "app": "X", "lookback_minutes": 60}}],
-                status="approved",
-                source="static_authored",
-                created_by="test",
-            )
-        )
-        session.add(
-            WorkflowDefinitionVersion(
-                id="WFDV_V3",
-                workflow_definition_id="WFD_X",
-                version_number=3,
-                document=[],
-                status="draft",
-                source="dynamic_generated",
-                created_by="test",
-            )
-        )
-        session.commit()
-    engine.dispose()
+    insert_docs(
+        db,
+        SourceSystem(
+            id="SYS_X", name="X", code="X", type="Application", description="x", owning_team="x", environment="NPE"
+        ),
+        Incident(
+            id="INC-1",
+            source="jira",
+            external_id="TT-1",
+            raw_text="x",
+            jira_key="TT-1",
+            classification_status="resolved",
+            source_system_id="SYS_X",
+            category=CATEGORY,
+        ),
+        WorkflowDefinition(id="WFD_X", source_system_id="SYS_X", category=CATEGORY),
+        WorkflowDefinitionVersion(
+            id="WFDV_V1",
+            workflow_definition_id="WFD_X",
+            version_number=1,
+            document=[{"call": "error_logs", "with": {"env": "NPE", "app": "X", "lookback_minutes": 60}}],
+            status="superseded",
+            source="static_authored",
+            created_by="test",
+        ),
+        WorkflowDefinitionVersion(
+            id="WFDV_V2",
+            workflow_definition_id="WFD_X",
+            version_number=2,
+            document=[{"call": "error_logs", "with": {"env": "NPE", "app": "X", "lookback_minutes": 60}}],
+            status="approved",
+            source="static_authored",
+            created_by="test",
+        ),
+        WorkflowDefinitionVersion(
+            id="WFDV_V3",
+            workflow_definition_id="WFD_X",
+            version_number=3,
+            document=[],
+            status="draft",
+            source="dynamic_generated",
+            created_by="test",
+        ),
+    )
 
 
-def test_retry_with_no_body_uses_active_version(app, postgres_url):
-    _seed(postgres_url)
+def test_retry_with_no_body_uses_active_version(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         response = client.post("/incidents/TT-1/retry", json={"requested_by": "u1"})
 
@@ -125,8 +111,8 @@ def test_retry_with_no_body_uses_active_version(app, postgres_url):
     assert body["rca_status"] is not None
 
 
-def test_retry_with_explicit_superseded_version_marks_overridden(app, postgres_url):
-    _seed(postgres_url)
+def test_retry_with_explicit_superseded_version_marks_overridden(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         response = client.post(
             "/incidents/TT-1/retry", json={"workflow_definition_version_id": "WFDV_V1", "requested_by": "u1"}
@@ -138,8 +124,8 @@ def test_retry_with_explicit_superseded_version_marks_overridden(app, postgres_u
     assert body["mapping_overridden"] is True
 
 
-def test_retry_against_draft_version_rejected(app, postgres_url):
-    _seed(postgres_url)
+def test_retry_against_draft_version_rejected(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         response = client.post(
             "/incidents/TT-1/retry", json={"workflow_definition_version_id": "WFDV_V3", "requested_by": "u1"}
@@ -148,16 +134,16 @@ def test_retry_against_draft_version_rejected(app, postgres_url):
     assert response.status_code == 422
 
 
-def test_retry_unknown_jira_key_404s(app, postgres_url):
-    _seed(postgres_url)
+def test_retry_unknown_jira_key_404s(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         response = client.post("/incidents/NOPE-1/retry", json={"requested_by": "u1"})
 
     assert response.status_code == 404
 
 
-def test_retry_history_shows_all_attempts_newest_first(app, postgres_url):
-    _seed(postgres_url)
+def test_retry_history_shows_all_attempts_newest_first(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         client.post("/incidents/TT-1/retry", json={"requested_by": "u1"})
         client.post(
@@ -171,12 +157,12 @@ def test_retry_history_shows_all_attempts_newest_first(app, postgres_url):
     assert {r["workflow_definition_version_id"] for r in rows} == {"WFDV_V1", "WFDV_V2"}
 
 
-def test_retry_reclassifies_so_a_fixed_mapping_rule_takes_effect(app, postgres_url, classifier):
+def test_retry_reclassifies_so_a_fixed_mapping_rule_takes_effect(app, sync_db, classifier):
     """Stored as unclassifiable; after the mapping rule is fixed (the
     classifier now resolves it), retry updates the incident and runs the
     playbook for the new classification."""
-    _seed(postgres_url)
-    _set_classification(postgres_url, "INC-1", MANUAL_TRIAGE)
+    _seed(sync_db)
+    _set_classification(sync_db, "INC-1", MANUAL_TRIAGE)
     classifier.return_value = RESOLVED_SYS_X
     with TestClient(app) as client:
         response = client.post("/incidents/TT-1/retry", json={"requested_by": "u1"})
@@ -189,8 +175,8 @@ def test_retry_reclassifies_so_a_fixed_mapping_rule_takes_effect(app, postgres_u
     assert incident["source_system_id"] == "SYS_X"
 
 
-def test_retry_records_not_classified_instead_of_rejecting(app, postgres_url, classifier):
-    _seed(postgres_url)
+def test_retry_records_not_classified_instead_of_rejecting(app, sync_db, classifier):
+    _seed(sync_db)
     classifier.return_value = MANUAL_TRIAGE
     with TestClient(app) as client:
         response = client.post("/incidents/TT-1/retry", json={"requested_by": "u1"})
@@ -203,16 +189,12 @@ def test_retry_records_not_classified_instead_of_rejecting(app, postgres_url, cl
     assert body["requested_by"] == "u1"
 
 
-def test_incident_without_jira_key_gets_a_generated_key_and_can_be_retried(app, postgres_url):
-    _seed(postgres_url)
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        first = Incident(source="teams", external_id="msg-1", raw_text="x")
-        second = Incident(source="teams", external_id="msg-2", raw_text="x")
-        session.add_all([first, second])
-        session.commit()
-        keys = [first.incident_key, second.incident_key]
-    engine.dispose()
+def test_incident_without_jira_key_gets_a_generated_key_and_can_be_retried(app, sync_db):
+    _seed(sync_db)
+    first = Incident(source="teams", external_id="msg-1", raw_text="x")
+    second = Incident(source="teams", external_id="msg-2", raw_text="x")
+    insert_docs(sync_db, first, second)
+    keys = [first.incident_key, second.incident_key]
 
     pattern = re.compile(r"^int_\d{14}_\d{5}$")
     assert all(pattern.match(k) for k in keys), keys
@@ -228,18 +210,18 @@ def test_incident_without_jira_key_gets_a_generated_key_and_can_be_retried(app, 
     assert [r["id"] for r in history] == [response.json()["id"]]
 
 
-def test_jira_incident_key_is_its_jira_key(app, postgres_url):
-    _seed(postgres_url)
+def test_jira_incident_key_is_its_jira_key(app, sync_db):
+    _seed(sync_db)
     with TestClient(app) as client:
         assert client.get("/incidents/INC-1").json()["incident_key"] == "TT-1"
 
 
-def _set_classification(postgres_url, incident_id: str, result: dict) -> None:
-    engine = make_engine(postgres_url)
-    with make_session_factory(engine)() as session:
-        incident = session.get(Incident, incident_id)
-        incident.classification_status = result["status"]
-        incident.source_system_id = result["source_system_id"]
-        incident.category = result["category"]
-        session.commit()
-    engine.dispose()
+def _set_classification(db, incident_id: str, result: dict) -> None:
+    set_fields(
+        db,
+        Incident,
+        incident_id,
+        classification_status=result["status"],
+        source_system_id=result["source_system_id"],
+        category=result["category"],
+    )

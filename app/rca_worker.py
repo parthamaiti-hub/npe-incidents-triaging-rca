@@ -23,15 +23,17 @@ import logging
 import uuid
 
 from openai import AsyncOpenAI
+from pymongo.asynchronous.database import AsyncDatabase
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import RCA_PENDING_STREAM, RCA_PENDING_STREAM_DLQ, RCA_WORKER_CONSUMER_GROUP
-from app.db import make_async_engine, make_async_session_factory
+from app.db import ensure_indexes, get_database, make_mongo_client
 from app.idempotency import make_redis
 from app.llm_client import make_openai_client
 from app.models import WorkflowExecution
 from app.rca_llm_synthesizer import synthesize_rca_via_llm
+from app.repositories.base import get, update_fields
+from app.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -73,27 +75,31 @@ async def publish_rca_pending(
 
 
 async def process_entry(
-    session_factory: async_sessionmaker, client: AsyncOpenAI, fields: dict
+    db: AsyncDatabase, client: AsyncOpenAI, fields: dict, vs: VectorStore | None = None
 ) -> None:
     execution_id = fields["execution_id"]
-    async with session_factory() as session:
-        execution = await session.get(WorkflowExecution, execution_id)
-        if execution is None:
-            logger.warning("WorkflowExecution %s not found, skipping", execution_id)
-            return
+    execution = await get(db, WorkflowExecution, execution_id)
+    if execution is None:
+        logger.warning("WorkflowExecution %s not found, skipping", execution_id)
+        return
 
-        evidence = json.loads(fields["evidence"])
-        operator_context = fields.get("operator_context") or None
-        result = await synthesize_rca_via_llm(session, client, evidence, operator_context)
+    evidence = json.loads(fields["evidence"])
+    operator_context = fields.get("operator_context") or None
+    result = await synthesize_rca_via_llm(db, client, evidence, operator_context, vs=vs)
 
-        execution.rca = {k: v for k, v in result.items() if k != "rca_meta"}
-        execution.rca_status = result["rca_status"]
-        execution.rca_meta = result["rca_meta"]
-        await session.commit()
+    await update_fields(
+        db,
+        execution,
+        {
+            "rca": {k: v for k, v in result.items() if k != "rca_meta"},
+            "rca_status": result["rca_status"],
+            "rca_meta": result["rca_meta"],
+        },
+    )
 
 
 async def process_with_retry(
-    session_factory: async_sessionmaker,
+    db: AsyncDatabase,
     client: AsyncOpenAI,
     redis: Redis,
     entry_id: str,
@@ -107,7 +113,7 @@ async def process_with_retry(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            await process_entry(session_factory, client, fields)
+            await process_entry(db, client, fields)
             return
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see app.playbook_engine
             last_error = exc
@@ -153,8 +159,9 @@ async def consume_one(
 
 async def run_rca_worker(consumer_name: str | None = None) -> None:
     consumer_name = consumer_name or f"rca-worker-{uuid.uuid4().hex[:8]}"
-    engine = make_async_engine()
-    session_factory = make_async_session_factory(engine)
+    mongo = make_mongo_client()
+    db = get_database(mongo)
+    await ensure_indexes(db)
     redis = make_redis()
     client = make_openai_client()
     await ensure_consumer_group(redis)
@@ -172,11 +179,11 @@ async def run_rca_worker(consumer_name: str | None = None) -> None:
             entry = await consume_one(redis, consumer_name, block_ms=3000)
             if entry is not None:
                 entry_id, fields = entry
-                await process_with_retry(session_factory, client, redis, entry_id, fields)
+                await process_with_retry(db, client, redis, entry_id, fields)
                 await redis.xack(RCA_PENDING_STREAM, RCA_WORKER_CONSUMER_GROUP, entry_id)  # at-least-once, deliberately
     finally:
         await redis.aclose()
-        await engine.dispose()
+        await mongo.close()
 
 
 if __name__ == "__main__":

@@ -3,33 +3,40 @@ document from an ask (a use case + an ordered list of {call, with} function
 requests), render it for approval, execute only approved versions, and keep
 every execution reproducible.
 
-Async throughout (AsyncSession) to match app.e2e_pipeline, its only current
-caller. dataloadscripts/load_catalog.py is sync and doesn't use this module
+Async throughout (an AsyncDatabase handle) to match app.e2e_pipeline, its
+only current caller. dataloadscripts/load_catalog.py is sync and doesn't use this module
 directly -- it creates the initial static_authored version itself (a much
 simpler bulk operation than the build/approve dance below), reusing
 app.workflow_spec.TaskSpec for the same validation rules.
 """
 
-import datetime
 import json
 import uuid
 
 from pydantic import ValidationError
+from pymongo.asynchronous.database import AsyncDatabase
 from redis.asyncio import Redis
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import rca_status
 from app.checks import has_implementation
 from app.classification import FULLY_CLASSIFIED_STATUSES
 from app.config import RCA_SYNTHESIS_LLM_ENABLED
 from app.correlation import build_correlation_context, correlate_incident
+from app.db import in_transaction
 from app.function_registry import FUNCTION_REGISTRY
 from app.idempotency import make_redis
-from app.models import Incident, WorkflowBuildRequest, WorkflowDefinition, WorkflowDefinitionVersion, WorkflowExecution
+from app.models import (
+    Incident,
+    WorkflowBuildRequest,
+    WorkflowDefinition,
+    WorkflowDefinitionVersion,
+    WorkflowExecution,
+    utcnow,
+)
 from app.playbook_engine import execute_workflow
 from app.rca_synthesizer import synthesize_rca
 from app.rca_worker import publish_rca_pending
+from app.repositories.base import find_one, get, insert, max_version_number, update_fields
 from app.workflow_spec import TaskSpec
 
 
@@ -119,7 +126,7 @@ def _validate_tasks(requested_functions: list[dict], preserve_pins_from: list[di
 
 
 async def build_workflow_from_request(
-    session: AsyncSession,
+    db: AsyncDatabase,
     source_system_id: str,
     category: str,
     requested_functions: list[dict],
@@ -142,7 +149,6 @@ async def build_workflow_from_request(
     )
 
     request = WorkflowBuildRequest(
-        id=str(uuid.uuid4()),
         source_system_id=source_system_id,
         category=category,
         requested_by=requested_by,
@@ -152,13 +158,11 @@ async def build_workflow_from_request(
         status="rendered",
         base_version_id=base_version.id if base_version is not None else None,
     )
-    session.add(request)
-    await session.commit()
-    return request
+    return await insert(db, request)
 
 
-async def _require_current_base(session: AsyncSession, definition_id: str, base_version_id: str) -> WorkflowDefinitionVersion:
-    base = await session.get(WorkflowDefinitionVersion, base_version_id)
+async def _require_current_base(db: AsyncDatabase, definition_id: str, base_version_id: str) -> WorkflowDefinitionVersion:
+    base = await get(db, WorkflowDefinitionVersion, base_version_id)
     if base is None or base.workflow_definition_id != definition_id:
         raise ValueError(f"No WorkflowDefinitionVersion {base_version_id!r} for definition {definition_id!r}")
     if base.status != "approved":
@@ -178,7 +182,7 @@ def preview_tasks(requested_functions: list[dict], base_version: WorkflowDefinit
 
 
 async def edit_workflow_version(
-    session: AsyncSession,
+    db: AsyncDatabase,
     definition_id: str,
     base_version_id: str,
     requested_functions: list[dict],
@@ -189,12 +193,12 @@ async def edit_workflow_version(
     the same (source_system, category) -- never an in-place change to the
     base version. Approving it (approve_build_request) publishes version N+1
     and supersedes N, exactly like any other build."""
-    definition = await session.get(WorkflowDefinition, definition_id)
+    definition = await get(db, WorkflowDefinition, definition_id)
     if definition is None:
         raise ValueError(f"No WorkflowDefinition {definition_id!r}")
-    base = await _require_current_base(session, definition_id, base_version_id)
+    base = await _require_current_base(db, definition_id, base_version_id)
     return await build_workflow_from_request(
-        session,
+        db,
         definition.source_system_id,
         definition.category,
         requested_functions,
@@ -204,108 +208,96 @@ async def edit_workflow_version(
     )
 
 
-async def approve_build_request(session: AsyncSession, request_id: str, approved_by: str) -> WorkflowDefinitionVersion:
+async def approve_build_request(db: AsyncDatabase, request_id: str, approved_by: str) -> WorkflowDefinitionVersion:
     """Only an approved version becomes executable. Creates the
     WorkflowDefinition if this is its first version; supersedes any
     previously-approved version for the same definition so at most one
-    version is ever "approved" at a time."""
-    request = await session.get(WorkflowBuildRequest, request_id)
+    version is ever "approved" at a time -- all in one transaction, so a
+    reader never sees zero or two approved versions. A concurrent approval
+    of the same definition loses on the unique indexes (DuplicateKeyError)
+    instead of producing a second approved version."""
+    request = await get(db, WorkflowBuildRequest, request_id)
     if request is None:
         raise ValueError(f"No WorkflowBuildRequest {request_id!r}")
     if request.status != "rendered":
         raise ValueError(f"WorkflowBuildRequest {request_id!r} is {request.status!r}, not 'rendered'")
     if request.base_version_id is not None:
-        base = await session.get(WorkflowDefinitionVersion, request.base_version_id)
+        base = await get(db, WorkflowDefinitionVersion, request.base_version_id)
         if base is not None:
-            await _require_current_base(session, base.workflow_definition_id, base.id)
+            await _require_current_base(db, base.workflow_definition_id, base.id)
 
-    definition = (
-        await session.scalars(
-            select(WorkflowDefinition).where(
-                WorkflowDefinition.source_system_id == request.source_system_id,
-                WorkflowDefinition.category == request.category,
+    async def publish(session) -> WorkflowDefinitionVersion:
+        definition = await find_one(
+            db,
+            WorkflowDefinition,
+            {"source_system_id": request.source_system_id, "category": request.category},
+            session=session,
+        )
+        if definition is None:
+            definition = await insert(
+                db,
+                WorkflowDefinition(
+                    id=f"WFD_{request.source_system_id}_{uuid.uuid4().hex[:8]}",
+                    source_system_id=request.source_system_id,
+                    category=request.category,
+                ),
+                session=session,
             )
-        )
-    ).first()
-    if definition is None:
-        definition = WorkflowDefinition(
-            id=f"WFD_{request.source_system_id}_{uuid.uuid4().hex[:8]}",
-            source_system_id=request.source_system_id,
-            category=request.category,
-        )
-        session.add(definition)
-        await session.flush()
 
-    prior_approved = (
-        await session.scalars(
-            select(WorkflowDefinitionVersion).where(
-                WorkflowDefinitionVersion.workflow_definition_id == definition.id,
-                WorkflowDefinitionVersion.status == "approved",
+        # Supersede before inserting: the one-approved-per-definition
+        # index is checked per write, not at commit.
+        await db[WorkflowDefinitionVersion.COLLECTION].update_many(
+            {"workflow_definition_id": definition.id, "status": "approved"},
+            {"$set": {"status": "superseded"}},
+            session=session,
+        )
+        version = WorkflowDefinitionVersion(
+            workflow_definition_id=definition.id,
+            version_number=await max_version_number(
+                db, WorkflowDefinitionVersion, "workflow_definition_id", definition.id, session=session
             )
+            + 1,
+            document=request.generated_document,
+            status="approved",
+            source="dynamic_generated",
+            build_request_id=request.id,
+            created_by=request.requested_by,
+            approved_by=approved_by,
+            approved_at=utcnow(),
         )
-    ).first()
-    if prior_approved is not None:
-        prior_approved.status = "superseded"
-
-    max_version = (
-        await session.scalars(
-            select(WorkflowDefinitionVersion.version_number)
-            .where(WorkflowDefinitionVersion.workflow_definition_id == definition.id)
-            .order_by(WorkflowDefinitionVersion.version_number.desc())
+        await insert(db, version, session=session)
+        await db[WorkflowBuildRequest.COLLECTION].update_one(
+            {"_id": request.id}, {"$set": {"status": "approved"}}, session=session
         )
-    ).first()
+        return version
 
-    version = WorkflowDefinitionVersion(
-        id=str(uuid.uuid4()),
-        workflow_definition_id=definition.id,
-        version_number=(max_version or 0) + 1,
-        document=request.generated_document,
-        status="approved",
-        source="dynamic_generated",
-        build_request_id=request.id,
-        created_by=request.requested_by,
-        approved_by=approved_by,
-        approved_at=datetime.datetime.now(datetime.timezone.utc),
-    )
-    session.add(version)
-
-    request.status = "approved"
-    await session.commit()
-    return version
+    return await in_transaction(db, publish)
 
 
-async def reject_build_request(session: AsyncSession, request_id: str, rejected_by: str, reason: str | None = None) -> None:
-    request = await session.get(WorkflowBuildRequest, request_id)
+async def reject_build_request(db: AsyncDatabase, request_id: str, rejected_by: str, reason: str | None = None) -> None:
+    request = await get(db, WorkflowBuildRequest, request_id)
     if request is None:
         raise ValueError(f"No WorkflowBuildRequest {request_id!r}")
-    request.status = "rejected"
-    await session.commit()
+    await update_fields(db, request, {"status": "rejected"})
 
 
 async def get_active_workflow(
-    session: AsyncSession, source_system_id: str, category: str
+    db: AsyncDatabase, source_system_id: str, category: str
 ) -> WorkflowDefinitionVersion | None:
     """The version app.e2e_pipeline executes -- the current 'approved'
     version for this (source_system, category), whether it was
     static_authored (via load_catalog.py) or dynamic_generated (via
     build_workflow_from_request + approve_build_request)."""
-    return (
-        await session.scalars(
-            select(WorkflowDefinitionVersion)
-            .join(WorkflowDefinition)
-            .where(
-                WorkflowDefinition.source_system_id == source_system_id,
-                WorkflowDefinition.category == category,
-                WorkflowDefinitionVersion.status == "approved",
-            )
-        )
-    ).first()
+    definition = await find_one(db, WorkflowDefinition, {"source_system_id": source_system_id, "category": category})
+    if definition is None:
+        return None
+    return await find_one(db, WorkflowDefinitionVersion, {"workflow_definition_id": definition.id, "status": "approved"})
 
 
 RETRYABLE_VERSION_STATUSES = ("approved", "superseded")
 
 
-async def get_version_for_retry(session: AsyncSession, version_id: str) -> WorkflowDefinitionVersion:
+async def get_version_for_retry(db: AsyncDatabase, version_id: str) -> WorkflowDefinitionVersion:
     """Resolves a workflow version for a retry run. Unlike
     normal execution (which only ever runs the current 'approved' version),
     a retry may deliberately target a superseded version -- the Retry
@@ -314,7 +306,7 @@ async def get_version_for_retry(session: AsyncSession, version_id: str) -> Workf
     version against historical evidence is a legitimate diagnostic action.
     draft/pending_approval/rejected stay blocked since those were never
     vetted at all."""
-    version = await session.get(WorkflowDefinitionVersion, version_id)
+    version = await get(db, WorkflowDefinitionVersion, version_id)
     if version is None:
         raise ValueError(f"No WorkflowDefinitionVersion {version_id!r}")
     if version.status not in RETRYABLE_VERSION_STATUSES:
@@ -326,7 +318,7 @@ async def get_version_for_retry(session: AsyncSession, version_id: str) -> Workf
 
 
 async def execute_and_record(
-    session: AsyncSession,
+    db: AsyncDatabase,
     version: WorkflowDefinitionVersion,
     jira_key: str | None = None,
     incident_id: str | None = None,
@@ -345,10 +337,9 @@ async def execute_and_record(
     Retry tab, persisted for audit and, once RCA_SYNTHESIS_LLM_ENABLED,
     passed through to the LLM prompt as its own labeled tier."""
     execution = WorkflowExecution(
-        id=str(uuid.uuid4()),
         jira_key=jira_key,
         incident_id=incident_id,
-        incident_key=await _incident_key_for(session, incident_id),
+        incident_key=await _incident_key_for(db, incident_id),
         workflow_definition_version_id=version.id,
         document_snapshot=version.document,
         triggered_by=triggered_by,
@@ -357,53 +348,48 @@ async def execute_and_record(
         operator_context=operator_context,
         status="running",
     )
-    session.add(execution)
-    await session.commit()
+    await insert(db, execution)
 
     try:
         evidence = await execute_workflow(version.document)
     except Exception:
-        execution.status = "failed"
-        execution.completed_at = datetime.datetime.now(datetime.timezone.utc)
-        await session.commit()
+        await update_fields(db, execution, {"status": "failed", "completed_at": utcnow()})
         raise
-
-    execution.evidence = evidence
-    execution.status = "completed"
-    execution.completed_at = datetime.datetime.now(datetime.timezone.utc)
 
     # A confirmed burst against the same application is
     # itself diagnostic signal, checked ahead of this run's own evidence.
     correlation = None
     if incident_id is not None:
-        incident = await session.get(Incident, incident_id)
+        incident = await get(db, Incident, incident_id)
         if incident is not None:
-            group = await correlate_incident(session, incident)
+            group = await correlate_incident(db, incident)
             if group is not None:
-                correlation = await build_correlation_context(session, group, exclude_incident_id=incident.id)
+                correlation = await build_correlation_context(db, group, exclude_incident_id=incident.id)
 
+    completed = {"evidence": evidence, "status": "completed", "completed_at": utcnow()}
     if correlation is not None or not RCA_SYNTHESIS_LLM_ENABLED:
         # Correlated executions stay fully deterministic --
         # no LLM call, no queueing, unambiguous and free. Same when the
         # LLM-primary path is off: today's synchronous deterministic
         # synthesis, unchanged.
         rca = synthesize_rca(evidence, correlation=correlation)
-        execution.rca = rca
-        execution.rca_status = rca["rca_status"]
+        await update_fields(db, execution, {**completed, "rca": rca, "rca_status": rca["rca_status"]})
     else:
         # Not correlated, LLM-primary is on -- hand
         # off to app.rca_worker via Redis Stream rather than blocking this
         # request on an LLM call. rca/rca_status stay None ("pending")
-        # until the worker writes them back.
+        # until the worker writes them back. Written before publishing so
+        # the worker's rca write can never be followed by this one; neither
+        # write touches the other's fields anyway.
+        await update_fields(db, execution, completed)
         redis = redis_client or make_redis()
         await publish_rca_pending(redis, execution.id, incident_id, jira_key, evidence, operator_context)
 
-    await session.commit()
     return execution
 
 
 async def record_unexecuted_attempt(
-    session: AsyncSession,
+    db: AsyncDatabase,
     *,
     jira_key: str | None,
     incident_id: str | None,
@@ -419,10 +405,9 @@ async def record_unexecuted_attempt(
     the dashboard/stats/retry-history
     endpoints read latest-per-incident from."""
     execution = WorkflowExecution(
-        id=str(uuid.uuid4()),
         jira_key=jira_key,
         incident_id=incident_id,
-        incident_key=await _incident_key_for(session, incident_id),
+        incident_key=await _incident_key_for(db, incident_id),
         workflow_definition_version_id=None,
         document_snapshot=[],
         evidence=[],
@@ -432,17 +417,15 @@ async def record_unexecuted_attempt(
         requested_by=requested_by,
         operator_context=operator_context,
         status="completed",
-        completed_at=datetime.datetime.now(datetime.timezone.utc),
+        completed_at=utcnow(),
     )
-    session.add(execution)
-    await session.commit()
-    return execution
+    return await insert(db, execution)
 
 
-async def _incident_key_for(session: AsyncSession, incident_id: str | None) -> str | None:
+async def _incident_key_for(db: AsyncDatabase, incident_id: str | None) -> str | None:
     if incident_id is None:
         return None
-    incident = await session.get(Incident, incident_id)
+    incident = await get(db, Incident, incident_id)
     return incident.incident_key if incident is not None else None
 
 
@@ -467,7 +450,7 @@ def not_classified_rca(classification_status: str) -> dict:
 
 
 async def run_rca_for_incident(
-    session: AsyncSession,
+    db: AsyncDatabase,
     incident: Incident,
     *,
     triggered_by: str,
@@ -484,7 +467,7 @@ async def run_rca_for_incident(
     if version is None:
         if incident.classification_status not in FULLY_CLASSIFIED_STATUSES:
             return await record_unexecuted_attempt(
-                session,
+                db,
                 jira_key=incident.jira_key,
                 incident_id=incident.id,
                 rca=not_classified_rca(incident.classification_status),
@@ -492,10 +475,10 @@ async def run_rca_for_incident(
                 requested_by=requested_by,
                 operator_context=operator_context,
             )
-        version = await get_active_workflow(session, incident.source_system_id, incident.category)
+        version = await get_active_workflow(db, incident.source_system_id, incident.category)
         if version is None:
             return await record_unexecuted_attempt(
-                session,
+                db,
                 jira_key=incident.jira_key,
                 incident_id=incident.id,
                 rca=no_playbook_rca(incident.source_system_id, incident.category),
@@ -507,11 +490,11 @@ async def run_rca_for_incident(
     else:
         active = None
         if incident.classification_status in FULLY_CLASSIFIED_STATUSES:
-            active = await get_active_workflow(session, incident.source_system_id, incident.category)
+            active = await get_active_workflow(db, incident.source_system_id, incident.category)
         mapping_overridden = active is None or version.id != active.id
 
     return await execute_and_record(
-        session,
+        db,
         version,
         jira_key=incident.jira_key,
         incident_id=incident.id,

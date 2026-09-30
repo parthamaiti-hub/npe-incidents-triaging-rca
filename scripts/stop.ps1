@@ -5,15 +5,17 @@
     services.
 
 .DESCRIPTION
-    Data in the postgres volume is preserved unless -RemoveVolumes is passed
-    -- that runs `docker compose down -v`, which deletes it.
+    Data in the mongodata/chromadata volumes is preserved unless
+    -RemoveVolumes is passed -- that runs `docker compose down -v`, which
+    deletes both. (Chroma is derived data; after a wipe, reload the catalogs
+    and run `uv run python -m scripts.rebuild_vector_index`.)
 
 .EXAMPLE
     .\scripts\stop.ps1
 .EXAMPLE
     .\scripts\stop.ps1 -KeepDockerRunning   # stop app processes only
 .EXAMPLE
-    .\scripts\stop.ps1 -RemoveVolumes       # also wipe the postgres volume
+    .\scripts\stop.ps1 -RemoveVolumes       # also wipe the mongo + chroma volumes
 #>
 param(
     [switch]$KeepDockerRunning,

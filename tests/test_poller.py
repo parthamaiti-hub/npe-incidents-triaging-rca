@@ -5,30 +5,43 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
 
 import app.poller as poller_module
-from app.db import Base, make_async_engine, make_async_session_factory, make_engine, make_session_factory
+from app.db import make_sync_mongo_client
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
 from app.idempotency import make_redis
 from app.models import Incident
 from app.poller import poll_once
 from app.worker import process_message
-from dataloadscripts.test_fixtures import GRAPH_MESSAGES_PAGE_RESPONSE, JIRA_ISSUE_RS_173234, seed_catalog_db
+from dataloadscripts.test_fixtures import (
+    GRAPH_MESSAGES_PAGE_RESPONSE,
+    JIRA_ISSUE_RS_173234,
+    find_docs,
+    get_doc,
+    open_db,
+    seeded_catalog_database,
+)
 
 REAL_CATALOG_PATH = Path(__file__).resolve().parents[1] / "dataloadscripts" / "npe_real_source_systems.yaml"
 
 
 @pytest.fixture(scope="module")
-def real_catalog_db(postgres_url):
-    engine = seed_catalog_db(postgres_url, catalog_path=REAL_CATALOG_PATH)
-    yield postgres_url
-    Base.metadata.drop_all(engine)
-    engine.dispose()
+def real_catalog_db(mongo_url):
+    """(mongo_url, database name) -- shared by the whole module."""
+    with seeded_catalog_database(mongo_url, REAL_CATALOG_PATH) as name:
+        yield mongo_url, name
+
+
+@pytest.fixture(scope="module")
+def catalog_sync_db(real_catalog_db):
+    mongo_url, name = real_catalog_db
+    client = make_sync_mongo_client(mongo_url)
+    yield client[name]
+    client.close()
 
 
 @respx.mock
-async def test_poll_once_upserts_incident_with_real_jira_fields(real_catalog_db, redis_url, rabbitmq_url):
+async def test_poll_once_upserts_incident_with_real_jira_fields(real_catalog_db, catalog_sync_db, redis_url, rabbitmq_url):
     respx.route(host="localhost").pass_through()  # let real testcontainer calls through unmocked
 
     respx.get(
@@ -39,17 +52,15 @@ async def test_poll_once_upserts_incident_with_real_jira_fields(real_catalog_db,
         return_value=httpx.Response(200, json={"issues": [JIRA_ISSUE_RS_173234]})
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
     redis = make_redis(redis_url)
     connection = await make_connection(rabbitmq_url)
     channel = await make_channel(connection)
     await declare_incidents_raw(channel)
 
     try:
-        async with httpx.AsyncClient() as http_client:
+        async with open_db(*real_catalog_db) as db, httpx.AsyncClient() as http_client:
             count = await poll_once(
-                session_factory,
+                db,
                 channel,
                 redis,
                 http_client,
@@ -62,39 +73,35 @@ async def test_poll_once_upserts_incident_with_real_jira_fields(real_catalog_db,
     finally:
         await connection.close()
         await redis.aclose()
-        await engine.dispose()
 
     assert count == 1
 
-    sync_engine = make_engine(real_catalog_db)
-    sync_session_factory = make_session_factory(sync_engine)
-    with sync_session_factory() as session:
-        incident = session.scalars(select(Incident).where(Incident.jira_key == "RS-173234")).one()
-        print(
-            f"\n[OUTCOME] jira_key={incident.jira_key} status={incident.status} "
-            f"priority={incident.priority} issue_type={incident.issue_type} "
-            f"assignee={incident.assignee} labels={incident.labels} "
-            f"teams_mentions={len(incident.teams_mentions or [])} "
-            f"addressed_team_raw={incident.addressed_team_raw} environment_raw={incident.environment_raw}"
-        )
-        assert incident.source == "jira"
-        assert incident.status == "In Progress"
-        assert incident.priority == "Urgent/Blocker"
-        assert incident.issue_type == "THE Bug"
-        assert incident.assignee == "Jvalant Dave"
-        assert incident.reporter == "Indrani Akula"
-        assert incident.labels == ["FIBER_QE_AUG_QLAB03", "Fiber_Automation"]
-        assert len(incident.teams_mentions) == 1
-        assert incident.teams_mentions[0]["author"] == "Dongale, Kapil"
-        # addressed_team is reporting metadata only, captured
-        # here but must not have influenced classification below.
-        assert incident.addressed_team_raw == "dpo-dice"
-        assert incident.environment_raw == "QLAB03"
+    [incident] = find_docs(catalog_sync_db, Incident, {"jira_key": "RS-173234"})
+    print(
+        f"\n[OUTCOME] jira_key={incident.jira_key} status={incident.status} "
+        f"priority={incident.priority} issue_type={incident.issue_type} "
+        f"assignee={incident.assignee} labels={incident.labels} "
+        f"teams_mentions={len(incident.teams_mentions or [])} "
+        f"addressed_team_raw={incident.addressed_team_raw} environment_raw={incident.environment_raw}"
+    )
+    assert incident.source == "jira"
+    assert incident.status == "In Progress"
+    assert incident.priority == "Urgent/Blocker"
+    assert incident.issue_type == "THE Bug"
+    assert incident.assignee == "Jvalant Dave"
+    assert incident.reporter == "Indrani Akula"
+    assert incident.labels == ["FIBER_QE_AUG_QLAB03", "Fiber_Automation"]
+    assert len(incident.teams_mentions) == 1
+    assert incident.teams_mentions[0]["author"] == "Dongale, Kapil"
+    # addressed_team is reporting metadata only, captured
+    # here but must not have influenced classification below.
+    assert incident.addressed_team_raw == "dpo-dice"
+    assert incident.environment_raw == "QLAB03"
 
 
 @respx.mock
 async def test_poll_once_incident_classifies_against_real_catalog_unchanged(
-    real_catalog_db, redis_url, rabbitmq_url, opa_url, monkeypatch
+    real_catalog_db, catalog_sync_db, redis_url, rabbitmq_url, opa_url, monkeypatch
 ):
     """A mocked Graph message -> extracted Jira key -> mocked Jira issue ->
     real Incident fields -> the SAME classification pipeline (extract_signals/OPA/classify_raw_text),
@@ -112,17 +119,15 @@ async def test_poll_once_incident_classifies_against_real_catalog_unchanged(
         return_value=httpx.Response(200, json={"issues": [JIRA_ISSUE_RS_173234]})
     )
 
-    engine = make_async_engine(real_catalog_db)
-    session_factory = make_async_session_factory(engine)
     redis = make_redis(redis_url)
     connection = await make_connection(rabbitmq_url)
     channel = await make_channel(connection)
     await declare_incidents_raw(channel)
 
     try:
-        async with httpx.AsyncClient() as http_client:
+        async with open_db(*real_catalog_db) as db, httpx.AsyncClient() as http_client:
             await poll_once(
-                session_factory,
+                db,
                 channel,
                 redis,
                 http_client,
@@ -135,48 +140,39 @@ async def test_poll_once_incident_classifies_against_real_catalog_unchanged(
     finally:
         await connection.close()
         await redis.aclose()
-        await engine.dispose()
 
-    sync_engine = make_engine(real_catalog_db)
-    sync_session_factory = make_session_factory(sync_engine)
-    with sync_session_factory() as session:
-        target_incident_id = session.scalars(
-            select(Incident.id).where(Incident.jira_key == "RS-173234")
-        ).one()
+    [target] = find_docs(catalog_sync_db, Incident, {"jira_key": "RS-173234"})
+    target_incident_id = target.id
 
     # incidents.raw is a plain queue shared across test modules in this
     # session -- other tests' unconsumed messages may precede ours in it.
     # Drain until this test's own incident is found, rather than assuming
     # the very next message is ours.
-    classify_engine = make_async_engine(real_catalog_db)
-    classify_session_factory = make_async_session_factory(classify_engine)
     classify_connection = await make_connection(rabbitmq_url)
     classify_channel = await make_channel(classify_connection)
     queue = await declare_incidents_raw(classify_channel)
     try:
-        async with queue.iterator() as iterator:
+        async with open_db(*real_catalog_db) as db, queue.iterator() as iterator:
             for _ in range(20):
                 message = await consume_one(iterator, timeout=20.0)
                 assert message is not None, "expected to find our incident on incidents.raw but ran out of messages"
                 payload = decode(message)
-                await process_message(classify_session_factory, payload)
+                await process_message(db, payload)
                 await message.ack()
                 if payload["incident_id"] == target_incident_id:
                     break
     finally:
         await classify_connection.close()
-        await classify_engine.dispose()
 
-    with sync_session_factory() as session:
-        incident = session.get(Incident, target_incident_id)
-        print(
-            f"\n[OUTCOME] jira_key={incident.jira_key} classification_status={incident.classification_status} "
-            f"source_system_id={incident.source_system_id} category={incident.category!r} "
-            f"matched_rule_id={incident.matched_rule_id}"
-        )
-        assert incident.classification_status == "resolved"
-        assert incident.source_system_id == "SYS_FIBER"
-        assert incident.category == "FUNCTIONAL DEFECT (QA/UAT)"
+    incident = get_doc(catalog_sync_db, Incident, target_incident_id)
+    print(
+        f"\n[OUTCOME] jira_key={incident.jira_key} classification_status={incident.classification_status} "
+        f"source_system_id={incident.source_system_id} category={incident.category!r} "
+        f"matched_rule_id={incident.matched_rule_id}"
+    )
+    assert incident.classification_status == "resolved"
+    assert incident.source_system_id == "SYS_FIBER"
+    assert incident.category == "FUNCTIONAL DEFECT (QA/UAT)"
 
 
 class _FakeIncident:
@@ -187,7 +183,7 @@ class _FakeIncident:
 
 async def test_poll_once_publishes_nothing_when_batch_fails_partway(monkeypatch):
     """upsert_incident_from_jira doesn't publish itself -- poll_once
-    collects and publishes only after the whole batch's session commits. If
+    collects and publishes only after the whole batch's transaction commits. If
     a later issue in the batch raises, nothing should have been published
     for ANY issue in that batch, including ones upserted successfully before
     the failure -- the old per-issue-inside-the-loop publish would have
@@ -199,7 +195,7 @@ async def test_poll_once_publishes_nothing_when_batch_fails_partway(monkeypatch)
     ordering."""
     calls = {"upsert": 0}
 
-    async def fake_upsert(session, issue, mentions):
+    async def fake_upsert(db, issue, mentions, session=None):
         calls["upsert"] += 1
         if calls["upsert"] == 1:
             return _FakeIncident("incident-1", "raw text one")
@@ -212,21 +208,14 @@ async def test_poll_once_publishes_nothing_when_batch_fails_partway(monkeypatch)
     monkeypatch.setattr(poller_module, "upsert_incident_from_jira", fake_upsert)
     monkeypatch.setattr(poller_module, "publish_incident_received", publish_mock)
 
-    class _NoopSession:
-        async def commit(self):
-            raise AssertionError("commit should never be reached -- the batch fails before it")
+    async def no_transaction(db, fn):
+        return await fn(None)
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc_info):
-            return False
-
-    session_factory = lambda: _NoopSession()  # noqa: E731
+    monkeypatch.setattr(poller_module, "in_transaction", no_transaction)
 
     with pytest.raises(RuntimeError, match="simulated failure"):
         await poll_once(
-            session_factory,
+            object(),
             channel=object(),
             redis=object(),
             http_client=object(),
@@ -236,3 +225,33 @@ async def test_poll_once_publishes_nothing_when_batch_fails_partway(monkeypatch)
 
     assert calls["upsert"] == 2
     publish_mock.assert_not_called()
+
+
+async def test_a_failing_batch_writes_no_incidents(sync_db, mongo_url, mongo_db_name, monkeypatch):
+    """The batch is one transaction, as it was one commit before: an issue
+    that fails after another was already upserted rolls that one back too
+    (so nothing is left stranded unpublished)."""
+    real_upsert = poller_module.upsert_incident_from_jira
+    calls = {"upsert": 0}
+
+    async def failing_second(db, issue, mentions, session=None):
+        calls["upsert"] += 1
+        if calls["upsert"] == 2:
+            raise RuntimeError("simulated failure on the second issue in this batch")
+        return await real_upsert(db, issue, mentions, session=session)
+
+    second_issue = {**JIRA_ISSUE_RS_173234, "key": "RS-173235"}
+    monkeypatch.setattr(poller_module, "get_channel_messages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(poller_module, "_collect_jira_mentions", lambda messages: {"RS-173234": [], "RS-173235": []})
+    monkeypatch.setattr(poller_module, "search_issues", AsyncMock(return_value=[JIRA_ISSUE_RS_173234, second_issue]))
+    monkeypatch.setattr(poller_module, "upsert_incident_from_jira", failing_second)
+    monkeypatch.setattr(poller_module, "publish_incident_received", AsyncMock())
+
+    async with open_db(mongo_url, mongo_db_name) as db:
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            await poll_once(
+                db, channel=object(), redis=object(), http_client=object(), access_token="fake-token",
+                since=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+
+    assert find_docs(sync_db, Incident) == []
