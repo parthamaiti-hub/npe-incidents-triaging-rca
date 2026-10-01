@@ -8,6 +8,7 @@ import { PlaybookEditor } from "@/components/PlaybookEditor";
 import { WorkflowGraph } from "@/components/WorkflowGraph";
 import { useMappingRulesForSourceSystem, useSourceSystems } from "@/lib/queries/catalog";
 import { useVersionYaml, useWorkflowDefinitions, useWorkflowVersions } from "@/lib/queries/workflows";
+import { playbookName } from "@/lib/workflowDraft";
 import { toGraphTasks, type GraphTask } from "@/lib/workflowGraph";
 
 // Tab 2 -- Playbooks for RCA: definition list on the
@@ -20,11 +21,34 @@ export default function PlaybooksPage() {
   // While a playbook is being edited, switching to another one is blocked so
   // an unsaved draft can't be silently lost.
   const [editing, setEditing] = useState(false);
+  const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
 
   const sourceSystemName = useMemo(() => {
     const map = new Map(sourceSystems?.map((s) => [s.id, s.name]) ?? []);
     return (id: string) => map.get(id) ?? id;
   }, [sourceSystems]);
+
+  // Client-side filter over the already-fetched list, same approach as
+  // system-mapping/page.tsx; category options come from live definitions.
+  const categoryOptions = useMemo(() => {
+    const values = new Set((definitions ?? []).map((d) => d.category).filter(Boolean));
+    return Array.from(values).sort();
+  }, [definitions]);
+
+  const filteredDefinitions = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (definitions ?? []).filter((d) => {
+      const matchesSearch =
+        !q ||
+        sourceSystemName(d.source_system_id).toLowerCase().includes(q) ||
+        d.source_system_id.toLowerCase().includes(q) ||
+        d.id.toLowerCase().includes(q) ||
+        playbookName(d.source_system_id, d.category).toLowerCase().includes(q);
+      const matchesCategory = !categoryFilter || d.category === categoryFilter;
+      return matchesSearch && matchesCategory;
+    });
+  }, [definitions, search, categoryFilter, sourceSystemName]);
 
   const selected = definitions?.find((d) => d.id === selectedId) ?? null;
 
@@ -39,10 +63,32 @@ export default function PlaybooksPage() {
 
       <div className="mt-2 grid grid-cols-1 gap-4 lg:grid-cols-[1fr_3fr]">
         <div className="rounded-md border border-grid bg-white">
+          <div className="flex flex-wrap gap-2 border-b border-grid p-2">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search playbook name…"
+              aria-label="Search playbooks by name"
+              className="min-w-0 flex-1 rounded border border-grid px-2 py-1 text-sm text-heading"
+            />
+            <select
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value)}
+              aria-label="Filter by category"
+              className="min-w-0 rounded border border-grid px-2 py-1 text-sm text-heading"
+            >
+              <option value="">All categories</option>
+              {categoryOptions.map((category) => (
+                <option key={category} value={category}>
+                  {category}
+                </option>
+              ))}
+            </select>
+          </div>
           {isLoading && <p className="p-4 text-sm text-muted">Loading…</p>}
           {isError && <p className="p-4 text-sm text-danger">Failed to load workflows.</p>}
-          <ul className="divide-y divide-grid">
-            {definitions?.map((def) => (
+          <ul aria-label="Playbooks" className="divide-y divide-grid">
+            {filteredDefinitions.map((def) => (
               <li key={def.id}>
                 <button
                   type="button"
@@ -60,6 +106,9 @@ export default function PlaybooksPage() {
             ))}
           </ul>
           {definitions?.length === 0 && <p className="p-4 text-sm text-muted">No workflows defined yet.</p>}
+          {!!definitions?.length && filteredDefinitions.length === 0 && (
+            <p className="p-4 text-sm text-muted">No playbooks match the filters.</p>
+          )}
         </div>
 
         <div>

@@ -43,7 +43,8 @@ async function versionCount(request: APIRequestContext, definitionId: string): P
 
 async function openEditor(page: Page, category: string) {
   await page.goto("/playbooks");
-  await page.getByText(category).click();
+  // Scoped to the list: the category also appears as an option in the category filter.
+  await page.getByRole("list", { name: "Playbooks" }).getByText(category).click();
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(yamlPane(page)).toContainText("error_logs");
 }

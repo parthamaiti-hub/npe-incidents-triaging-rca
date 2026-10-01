@@ -29,7 +29,8 @@ test("build wizard creates and approves a new workflow version", async ({ page }
   // on the option's existence/selected state rather than visibility.
   await page.getByRole("link", { name: "View in Playbooks" }).click();
   await expect(page).toHaveURL(/\/playbooks$/);
-  await page.getByText(category).click();
+  // Scoped to the list: the category also appears as an option in the category filter.
+  await page.getByRole("list", { name: "Playbooks" }).getByText(category).click();
   const versionSelect = page.getByLabel("Version");
   await expect(versionSelect).toBeVisible();
   await expect(versionSelect.locator("option", { hasText: "v1 (approved)" })).toHaveCount(1);
