@@ -44,6 +44,19 @@ def _llm_feature_flags_off_by_default(monkeypatch):
     monkeypatch.setattr(main_module, "RCA_SYNTHESIS_LLM_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _restore_function_caches():
+    """FUNCTION_REGISTRY / FUNCTION_VERSIONS are process-wide caches that
+    app startup, the /functions router and some tests mutate in place.
+    Every test gets them back exactly as it found them, so one test's
+    database (each test has its own) never leaks versions into the next."""
+    from app.function_registry import reset_function_registry, snapshot_function_registry
+
+    registry, versions = snapshot_function_registry()
+    yield
+    reset_function_registry(registry, versions)
+
+
 @pytest.fixture(scope="session")
 def mongo_url():
     """A single-node replica set (not a plain mongod): the app's

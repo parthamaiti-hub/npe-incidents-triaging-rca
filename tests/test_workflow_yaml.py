@@ -22,24 +22,44 @@ STORED = [
 ]
 
 
-def _strip_pins(tasks):
-    return [{k: v for k, v in t.items() if not k.startswith("function_version")} for t in tasks]
+def _as_authored(tasks):
+    """A stored task as YAML expresses it: the pinned number becomes the
+    task's `version`; the other server-only fields disappear."""
+    authored = []
+    for t in tasks:
+        task = {k: v for k, v in t.items() if not k.startswith("function_version") and k != "resolved_retry"}
+        if t.get("function_version_number") is not None:
+            task["version"] = t["function_version_number"]
+        authored.append(task)
+    return authored
 
 
-def test_render_is_cncf_shaped_and_hides_pins():
+def test_render_is_cncf_shaped_shows_version_and_hides_server_fields():
     text = tasks_to_cncf_yaml(STORED, name="SYS_X-func", version=3)
     doc = yaml.safe_load(text)
     assert doc["document"] == {"dsl": "1.0.0", "namespace": "npe-rca", "name": "SYS_X-func", "version": "3"}
     assert list(doc["do"][0]) == ["error_logs"]
     assert list(doc["do"][1]) == ["deploys"]
     assert doc["do"][1]["deploys"]["retry"]["max_attempts"] == 5
+    # Sol-104: the YAML shows exactly which check version each task runs.
+    assert doc["do"][0]["error_logs"]["version"] == 1
+    assert doc["do"][1]["deploys"]["version"] == 2
     assert "function_version" not in text
+    assert "resolved_retry" not in tasks_to_cncf_yaml([{**STORED[0], "resolved_retry": {"max_attempts": 3}}])
 
 
-def test_round_trip_is_lossless_apart_from_pins():
+def test_round_trip_is_lossless_apart_from_server_fields():
     parsed = cncf_yaml_to_tasks(tasks_to_cncf_yaml(STORED))
-    assert parsed.tasks == _strip_pins(STORED)
+    assert parsed.tasks == _as_authored(STORED)
     assert len(parsed.task_lines) == 2 and parsed.task_lines[0] < parsed.task_lines[1]
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "two", "1.5", "true"])
+def test_version_must_be_a_positive_integer(bad):
+    with pytest.raises(WorkflowYamlError) as exc:
+        cncf_yaml_to_tasks(f"do:\n  - a:\n      call: error_logs\n      version: {bad}\n      with: {{}}\n")
+    assert exc.value.kind == "schema"
+    assert exc.value.errors[0].path == "do[0].a.version"
 
 
 def test_duplicate_unnamed_calls_get_distinct_keys_on_render():

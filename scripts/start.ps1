@@ -79,9 +79,20 @@ foreach ($service in @("mongo", "chroma")) {
 }
 
 if (-not $SkipCatalogLoad) {
-    Write-Host "==> loading catalogs"
-    uv run python -m dataloadscripts.load_catalog --file dataloadscripts/source_systems.yaml
-    uv run python -m dataloadscripts.load_catalog --file dataloadscripts/npe_real_source_systems.yaml
+    Write-Host "==> loading catalogs (each load runs the catalog check first; errors abort it, warnings are printed)"
+    foreach ($catalogFile in @("dataloadscripts/source_systems.yaml", "dataloadscripts/npe_real_source_systems.yaml")) {
+        uv run python -m dataloadscripts.load_catalog --file $catalogFile
+        if ($LASTEXITCODE -ne 0) {
+            throw "Catalog load refused for $catalogFile (see the catalog check errors above) -- nothing from it was written. Fix the YAML, or start with -SkipCatalogLoad to run with what is already loaded."
+        }
+    }
+    # Every source system's DEFAULT (fallback) playbook, from
+    # dataloadscripts/default_rca_playbook.yaml -- runs when a category can't
+    # be mapped; the run is marked DefaultRCA. Customized ones are left alone.
+    uv run python -m dataloadscripts.load_default_playbooks
+    if ($LASTEXITCODE -ne 0) {
+        throw "DEFAULT playbook load refused (see the catalog check errors above)."
+    }
     uv run python -m dataloadscripts.load_function_registry
     uv run python -m dataloadscripts.seed_functional_dummy_versions
     uv run python -m dataloadscripts.seed_rca_pattern_types

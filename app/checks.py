@@ -17,12 +17,14 @@ just two different declared param lists -- run_check raises for a version
 with no entry rather than silently falling back to another version's
 behavior.
 
-Version 1 of every check_type is a template-fill stub (below). Version 2,
-where published, is real per-function Python code -- see
-app/check_implementations.py.
+Version 1 of every original check_type is a template-fill stub (below).
+Every other version is a module app/check_types/<check_type>_v<N>.py, found
+automatically by app.check_implementations (Sol-104) -- there is no
+per-version branch here, so v3, v4, ... and brand-new check_types need no
+change to this file.
 """
 
-from app.check_implementations import CHECK_IMPLEMENTATIONS_V2
+from app.check_implementations import CHECK_IMPLEMENTATIONS, CheckFn
 
 # (status, details_template) -- details_template is filled with the step's
 # params via str.format(**params), falling back to the raw template if a
@@ -76,36 +78,64 @@ STUB_RESULTS: dict[str, dict[int, tuple[str, str]]] = {
 }
 
 
-def _available_versions(check_type: str) -> list[int]:
-    versions = sorted(STUB_RESULTS.get(check_type, {}))
-    if check_type in CHECK_IMPLEMENTATIONS_V2:
-        versions.append(2)
-    return versions
+_overlap = sorted(
+    (check_type, version) for check_type, versions in STUB_RESULTS.items() for version in versions
+    if (check_type, version) in CHECK_IMPLEMENTATIONS
+)
+if _overlap:
+    raise RuntimeError(
+        f"{_overlap} have both a STUB_RESULTS template and an app/check_types module -- "
+        f"a (check_type, version) must have exactly one implementation"
+    )
 
 
-def has_implementation(check_type: str, version_number: int) -> bool:
-    if version_number in STUB_RESULTS.get(check_type, {}):
-        return True
-    return version_number == 2 and check_type in CHECK_IMPLEMENTATIONS_V2
-
-
-async def run_check(check_type: str, params: dict, version_number: int = 1) -> dict:
-    if version_number in STUB_RESULTS.get(check_type, {}):
-        status, template = STUB_RESULTS[check_type][version_number]
+def _template_impl(status: str, template: str) -> CheckFn:
+    async def run(params: dict) -> dict:
         try:
             details = template.format(**params)
         except (KeyError, IndexError):
             details = template
         return {"status": status, "details": details}
 
-    if version_number == 2 and check_type in CHECK_IMPLEMENTATIONS_V2:
-        return await CHECK_IMPLEMENTATIONS_V2[check_type](params)
+    return run
 
-    if check_type not in STUB_RESULTS and check_type not in CHECK_IMPLEMENTATIONS_V2:
+
+def get_implementation(check_type: str, version_number: int) -> CheckFn | None:
+    """The code for exactly this (check_type, version), or None. Never
+    falls back to another version: two versions are two pieces of code."""
+    stub = STUB_RESULTS.get(check_type, {}).get(version_number)
+    if stub is not None:
+        return _template_impl(*stub)
+    return CHECK_IMPLEMENTATIONS.get((check_type, version_number))
+
+
+def implementation_kind(check_type: str, version_number: int) -> str | None:
+    """"template" | "python" | None -- for the /functions source endpoint."""
+    if version_number in STUB_RESULTS.get(check_type, {}):
+        return "template"
+    if (check_type, version_number) in CHECK_IMPLEMENTATIONS:
+        return "python"
+    return None
+
+
+def implemented_versions(check_type: str) -> list[int]:
+    versions = set(STUB_RESULTS.get(check_type, {}))
+    versions |= {v for (name, v) in CHECK_IMPLEMENTATIONS if name == check_type}
+    return sorted(versions)
+
+
+def has_implementation(check_type: str, version_number: int) -> bool:
+    return get_implementation(check_type, version_number) is not None
+
+
+async def run_check(check_type: str, params: dict, version_number: int = 1) -> dict:
+    impl = get_implementation(check_type, version_number)
+    if impl is not None:
+        return await impl(params)
+
+    available = implemented_versions(check_type)
+    if not available:
         raise ValueError(f"Unknown check_type: {check_type!r}")
     raise ValueError(
-        f"No implementation for check_type {check_type!r} version {version_number} "
-        f"(have versions: {_available_versions(check_type)})"
+        f"No implementation for check_type {check_type!r} version {version_number} (have versions: {available})"
     )
-
-    return {"status": status, "details": details}

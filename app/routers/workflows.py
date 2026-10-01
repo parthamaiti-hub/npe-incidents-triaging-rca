@@ -9,6 +9,8 @@ import re
 
 import logging
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 from pymongo.asynchronous.database import AsyncDatabase
@@ -31,13 +33,16 @@ from app.workflow_orchestrator import (
     WorkflowValidationError,
     approve_build_request,
     build_workflow_from_request,
+    dry_run_build_request,
     edit_workflow_version,
     execute_and_record,
     get_active_workflow,
     preview_tasks,
     reject_build_request,
+    upgrade_workflow_version,
 )
 from app.repositories.base import find, get, insert
+from app.task_pinning import describe_pins
 from app.workflow_yaml import ParsedWorkflow, WorkflowYamlError, cncf_yaml_to_tasks, tasks_to_cncf_yaml
 
 logger = logging.getLogger(__name__)
@@ -94,6 +99,10 @@ class WorkflowExecutionOut(BaseModel):
     triggered_by: str
     requested_by: str | None
     mapping_overridden: bool
+    # Mapped | DefaultRCA | Override (None when nothing ran) -- see
+    # WorkflowExecution.triage_mode; triage_note says why for DefaultRCA.
+    triage_mode: str | None = None
+    triage_note: str | None = None
     status: str
     started_at: datetime.datetime
     completed_at: datetime.datetime | None
@@ -195,6 +204,24 @@ class EditWorkflowIn(BaseModel):
         return self
 
 
+class UpgradeWorkflowIn(BaseModel):
+    """Move tasks of the approved version to a newer check_type version.
+    calls: check_type names in the playbook, or "all". to: "active" (each
+    function's active version) or an explicit version number."""
+
+    base_version_id: str
+    calls: list[str] | Literal["all"]
+    to: Literal["active"] | int = "active"
+    requested_by: str
+    change_note: str | None = None
+
+
+class DryRunOut(BaseModel):
+    build_request_id: str
+    evidence: list[dict]
+    rca: dict
+
+
 def _playbook_name(definition: WorkflowDefinition) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", definition.category.lower()).strip("-")
     return f"{definition.source_system_id}-{slug}"
@@ -275,6 +302,10 @@ async def get_build_request(request_id: str, db: AsyncDatabase = Depends(get_db)
 async def approve(request_id: str, payload: ApproveRequestIn, db: AsyncDatabase = Depends(get_db)):
     try:
         version = await approve_build_request(db, request_id, payload.approved_by)
+    except WorkflowValidationError as exc:
+        # e.g. a task pins a draft check version (activate it first) or one
+        # retired since the request was rendered.
+        raise HTTPException(422, {"kind": "registry", "message": str(exc), "errors": exc.errors})
     except WorkflowConflictError as exc:
         raise HTTPException(409, str(exc))
     except DuplicateKeyError as exc:
@@ -283,6 +314,19 @@ async def approve(request_id: str, payload: ApproveRequestIn, db: AsyncDatabase 
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     return WorkflowDefinitionVersionOut.model_validate(version, from_attributes=True)
+
+
+@router.post("/build-requests/{request_id}/dry-run", response_model=DryRunOut)
+async def dry_run(request_id: str, db: AsyncDatabase = Depends(get_db)):
+    """Runs a rendered (unapproved) build request's checks and synthesizes
+    an RCA without persisting anything -- try a draft check version or an
+    upgrade before approving it."""
+    try:
+        return await dry_run_build_request(db, request_id)
+    except WorkflowValidationError as exc:
+        raise HTTPException(422, str(exc))
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
 @router.post("/build-requests/{request_id}/reject", status_code=204)
@@ -330,6 +374,43 @@ async def version_yaml(version_id: str, db: AsyncDatabase = Depends(get_db)):
     return WorkflowYamlOut(
         yaml=tasks_to_cncf_yaml(version.document, name=_playbook_name(definition), version=version.version_number)
     )
+
+
+@router.get("/versions/{version_id}/pins")
+async def version_pins(version_id: str, db: AsyncDatabase = Depends(get_db)):
+    """Each task's pinned check version against the function's active
+    version: up_to_date | upgrade_available | ahead_of_active | retired |
+    missing | no_active_version, with the contract diff an upgrade brings."""
+    version = await get(db, WorkflowDefinitionVersion, version_id)
+    if version is None:
+        raise HTTPException(404, f"WorkflowDefinitionVersion {version_id!r} not found")
+    return {"workflow_version_id": version.id, "version_number": version.version_number, "tasks": describe_pins(version.document)}
+
+
+@router.post("/definitions/{definition_id}/upgrade", response_model=WorkflowBuildRequestOut, status_code=201)
+async def upgrade_definition(definition_id: str, payload: UpgradeWorkflowIn, db: AsyncDatabase = Depends(get_db)):
+    """Re-pins the named tasks of the approved version to a newer check
+    version (other tasks keep their pins) as a 'rendered' build request --
+    approve it to publish version N+1. 409 if base_version_id is no longer
+    the approved version; 422 if a moved task doesn't satisfy the new
+    contract (add the param via a normal edit)."""
+    try:
+        request = await upgrade_workflow_version(
+            db,
+            definition_id,
+            payload.base_version_id,
+            payload.calls,
+            payload.requested_by,
+            to=payload.to,
+            change_note=payload.change_note,
+        )
+    except WorkflowValidationError as exc:
+        raise _validation_422(exc, None)
+    except WorkflowConflictError as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    return WorkflowBuildRequestOut.model_validate(request, from_attributes=True)
 
 
 @router.post("/render-yaml", response_model=WorkflowYamlOut)

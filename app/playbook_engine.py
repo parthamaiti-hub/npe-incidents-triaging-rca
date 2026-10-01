@@ -10,7 +10,19 @@ data-driven dispatch -- a single generic engine.
 import asyncio
 
 from app.checks import run_check
-from app.function_registry import FUNCTION_REGISTRY, RetryPolicy
+from app.function_registry import FUNCTION_REGISTRY, RetryPolicy, get_function_spec, is_known_function
+
+
+def _retry_policy(task: dict, call: str, version_number: int) -> RetryPolicy:
+    """Explicit task retry, else the retry snapshotted into the task at
+    build time, else the *pinned* version's contract -- never the active
+    version's, so publishing a new check version can't change how an
+    already-approved playbook behaves (Sol-104 V5)."""
+    retry = task.get("retry") or task.get("resolved_retry")
+    if retry is None:
+        spec = get_function_spec(call, version_number) or FUNCTION_REGISTRY.get(call)
+        retry = spec.default_retry if spec is not None else RetryPolicy()
+    return RetryPolicy(**retry) if isinstance(retry, dict) else retry
 
 
 async def _run_with_retry(dispatch, call: str, params: dict, version_number: int, retry: RetryPolicy) -> dict:
@@ -18,7 +30,7 @@ async def _run_with_retry(dispatch, call: str, params: dict, version_number: int
     for attempt in range(1, retry.max_attempts + 1):
         try:
             result = await dispatch(call, params, version_number)
-            return {"check": call, "params": params, **result}
+            return {"check": call, "version": version_number, "params": params, **result}
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: any failing check becomes an ERROR entry
             last_error = exc
             if attempt < retry.max_attempts:
@@ -27,6 +39,7 @@ async def _run_with_retry(dispatch, call: str, params: dict, version_number: int
                     await asyncio.sleep(delay)
     return {
         "check": call,
+        "version": version_number,
         "params": params,
         "status": "ERROR",
         "details": f"Exhausted {retry.max_attempts} attempt(s): {last_error}",
@@ -56,13 +69,9 @@ async def execute_workflow(tasks: list[dict], dispatch=run_check) -> list[dict]:
         call = task["call"]
         params = task.get("with", {})
         version_number = task.get("function_version_number") or 1
-        spec = FUNCTION_REGISTRY.get(call)
-        if spec is None:
+        if not is_known_function(call):
             raise ValueError(f"Unknown function/check_type: {call!r} -- not in FUNCTION_REGISTRY")
 
-        retry = task.get("retry") or spec.default_retry
-        if isinstance(retry, dict):
-            retry = RetryPolicy(**retry)
-
+        retry = _retry_policy(task, call, version_number)
         evidence.append(await _run_with_retry(dispatch, call, params, version_number, retry))
     return evidence

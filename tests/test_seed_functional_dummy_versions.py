@@ -19,7 +19,7 @@ def test_publishes_an_active_v2_for_every_function_with_v2_code(sync_db):
     for name, versions in by_function.items():
         v1 = next(v for v in versions if v.version_number == 1)
         v2 = next(v for v in versions if v.version_number == 2)
-        assert v1.status == "superseded"
+        assert v1.status == "deprecated"  # still runs for playbooks pinned to it
         assert v2.status == "active"
         assert v2.created_by == "functional_dummy_seed"
 

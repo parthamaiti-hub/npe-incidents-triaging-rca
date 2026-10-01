@@ -26,6 +26,7 @@ from app.config import LLM_FALLBACK_ENABLED
 from app.db import ensure_indexes, get_database, make_mongo_client
 from app.embeddings import embed_resolved_incident, incident_is_embedded
 from app.events import consume_one, decode, declare_incidents_raw, make_channel, make_connection
+from app.function_registry import refresh_function_registry_from_db
 from app.llm_client import make_openai_client
 from app.models import Incident, WorkflowExecution
 from app.repositories.base import exists, get
@@ -192,6 +193,9 @@ async def run_worker() -> None:
     mongo = make_mongo_client()
     db = get_database(mongo)
     await ensure_indexes(db)
+    # The worker runs RCAs itself, so it needs the DB's function versions
+    # (pinned contracts, retry policies), not just the built-in defaults.
+    await refresh_function_registry_from_db(db)
     openai_client = make_openai_client()  # construction is lazy/local -- no network call until first use
 
     try:

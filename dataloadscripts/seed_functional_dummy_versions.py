@@ -9,9 +9,9 @@ the evidence exactly which functions were actually invoked -- for testing
 realistic monitoring data.
 
 Idempotent: if a function already has an active version 2, leaves it alone.
-Explicitly targets version_number=2 (not "whatever's next") so it always
-lines up with app.check_implementations.CHECK_IMPLEMENTATIONS_V2's fixed
-version-2 dispatch -- see app/checks.py::run_check.
+Explicitly targets version_number=2 (not "whatever's next") so the contract
+lines up with the code it describes: app/check_types/<name>_v2.py, which
+app.check_implementations registers as (name, 2).
 
 Safe to run against a live catalog: existing WorkflowDefinitionVersion
 documents keep executing whichever version they were built against
@@ -49,27 +49,29 @@ def publish_functional_dummy_versions(db: Database) -> int:
 
             existing_v2 = versions.find_one({"function_definition_id": name, "version_number": 2}, session=session)
 
-            # Always supersede the current active version *before* activating
+            # Always deprecate the current active version *before* activating
             # another one: one active version per function is index-enforced.
+            # Deprecated versions keep running for every playbook pinned to
+            # them (Sol-104 lifecycle); only new pins default to v2.
             if existing_v2 is not None:
                 if existing_v2["status"] != "active":
                     versions.update_many(
                         {"function_definition_id": name, "status": "active"},
-                        {"$set": {"status": "superseded"}},
+                        {"$set": {"status": "deprecated"}},
                         session=session,
                     )
                     versions.update_one({"_id": existing_v2["_id"]}, {"$set": {"status": "active"}}, session=session)
                 continue
 
             versions.update_many(
-                {"function_definition_id": name, "status": "active"}, {"$set": {"status": "superseded"}}, session=session
+                {"function_definition_id": name, "status": "active"}, {"$set": {"status": "deprecated"}}, session=session
             )
             version = FunctionDefinitionVersion(
                 function_definition_id=name,
                 version_number=2,
                 description=(
                     f"[FUNCTIONAL DUMMY v2] {spec.description} Real callable "
-                    f"(app.check_implementations.{name}_v2) that logs the OS user, "
+                    f"(app/check_types/{name}_v2.py) that logs the OS user, "
                     f"calling function, and timestamp on every invocation."
                 ),
                 params=[p.model_dump() for p in spec.params],

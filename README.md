@@ -91,6 +91,7 @@ curl http://localhost:8421/health     # exercises database, Redis and RabbitMQ; 
 docker compose up -d
 uv run python -m dataloadscripts.load_catalog --file dataloadscripts/source_systems.yaml
 uv run python -m dataloadscripts.load_catalog --file dataloadscripts/npe_real_source_systems.yaml
+uv run python -m dataloadscripts.load_default_playbooks   # one DEFAULT (fallback) playbook per source system
 uv run python -m dataloadscripts.load_function_registry
 uv run python -m dataloadscripts.seed_functional_dummy_versions
 uv run python -m dataloadscripts.seed_rca_pattern_types
@@ -103,6 +104,14 @@ uv run python -m app.sweeper              # stuck-incident sweeper
 ```
 
 All loaders are idempotent (rows are upserted by primary key).
+
+Every `load_catalog` run first runs the **catalog check** (`dataloadscripts/check_catalog.py`). Errors (duplicate ids or rules, unknown signal types, regexes OPA's RE2 can't run, category spelling drift, two playbooks for one (system, category), invalid playbook steps or pins) abort the load with nothing written, and stop `scripts/start.ps1`. Warnings (unreachable playbooks, rules with no playbook, rules that tie or are shadowed by another rule) are printed. Check a file without loading it:
+
+```
+uv run python -m dataloadscripts.check_catalog --file dataloadscripts/npe_real_source_systems.yaml [--strict] [--no-db]
+```
+
+See `design/NPE_Incident_PlaybookMappingProcess.md` §9.2 for every check and its level.
 
 Post a test incident (PowerShell). The worker classifies it and runs its first RCA; it appears on the dashboard
 under a generated `int_...` ID:
@@ -170,16 +179,20 @@ feedback. Don't expose the stack beyond localhost or a trusted network.
 **Check functions** (`app/function_registry.py`) declare the contract — typed params and default retry policy — for
 20 check types (`error_logs`, `recent_deployments`, `service_health`, …).
 
-- Functions are versioned: a `FunctionDefinition` has many immutable `FunctionDefinitionVersion` rows, one `active`
-  at a time. A change is always a new version.
-- `FUNCTION_REGISTRY` is an in-memory cache of the active versions, refreshed at startup and on every `/functions`
-  write; it falls back to built-in defaults on an unseeded database.
-- A version only runs if it has an implementation: `app/checks.py::STUB_RESULTS` (v1 template stubs) or
-  `app/check_implementations.py` (v2, one async function per check type). Referencing a version without one is
-  rejected when the playbook is built, not at run time.
+- Functions are versioned: a `FunctionDefinition` has many immutable `FunctionDefinitionVersion` rows. A change is
+  always a new version. Lifecycle (see `design/Sol-104-CheckType_Versioning.md`):
+  `draft` → `active` (exactly one; the default for new pins) → `deprecated` (still runs wherever pinned) → `retired`
+  (never runs; only allowed once no playbook pins it).
+- `FUNCTION_REGISTRY` caches the active versions and `FUNCTION_VERSIONS` every version; both are refreshed at startup
+  (API and worker) and on every `/functions` write, and fall back to built-in defaults on an unseeded database.
+- A version only runs if it has an implementation: a v1 template in `app/checks.py::STUB_RESULTS`, or a module
+  `app/check_types/<check_type>_v<N>.py` exporting `async def run(params) -> dict`, discovered automatically by
+  filename. **A new version or a brand-new check type is one new file** — no dispatcher change. Referencing a
+  version without code is rejected when the playbook is built, not at run time; `GET /functions/integrity` (also
+  logged at startup) reports pinned versions that couldn't run.
 - **Check results are stubbed.** Every evidence line is marked `[STUBBED]` or `[FUNCTIONAL DUMMY v2]`. The v2
-  functions log the caller and timestamp so you can prove which checks actually ran. To integrate a real system,
-  replace one function body in `app/check_implementations.py`.
+  modules log the caller and timestamp so you can prove which checks actually ran. To integrate a real system, add
+  the next version's module (e.g. `error_logs_v3.py`) and publish its contract.
 
 **Playbooks** are a subset of the [CNCF Serverless Workflow](https://serverlessworkflow.io) DSL, executed in-process
 (no external orchestrator): a sequence of `call` tasks with `with` params and an optional `retry` override
@@ -188,7 +201,12 @@ feedback. Don't expose the stack beyond localhost or a trusted network.
 - Versioned like functions: `WorkflowDefinition` → immutable `WorkflowDefinitionVersion` rows. Approving a new
   version supersedes the previous one; only the `approved` version executes.
 - Each task is pinned to a function version when the playbook is built, so later function changes don't alter a
-  published playbook.
+  published playbook. The pin is: an explicit `version:` on the task, else (when editing or reloading) the pin the
+  unchanged task already had, else the active version. The pinned version's retry policy is copied into the task,
+  and params are validated against the pinned version's contract. Evidence records the `version` that ran.
+- Moving a playbook to a newer check version is always a new, approved playbook version: edit the task's
+  `version:`, or `POST /workflows/definitions/{id}/upgrade`. Publishing a check version never changes an existing
+  playbook, and reloading the catalog never re-pins (unless `--upgrade-functions` is passed).
 - Playbooks come from two sources: statically authored in the catalog YAML (`load_catalog.py`), or built from a
   request (`{call, with}` list) that is validated, rendered, then approved — via the UI, API, or CLI.
 - Editing an existing version creates a new build request based on it; unchanged steps keep their function pins,
@@ -196,6 +214,15 @@ feedback. Don't expose the stack beyond localhost or a trusted network.
   CNCF YAML (`document:` + `do:`) through the API.
 - A failed check doesn't abort the run: exhausted retries record an `ERROR` evidence entry and the playbook continues.
 - Every run is stored as a `WorkflowExecution` with a snapshot of exactly what executed, its evidence and its RCA.
+
+**DEFAULT playbooks / DefaultRCA.** Every source system can have a fallback playbook with the reserved category
+`DEFAULT` (`RCA_<CODE>_DEFAULT`, same checks as the FUNC playbooks; template
+`dataloadscripts/default_rca_playbook.yaml`, loaded by `dataloadscripts/load_default_playbooks.py`). When an incident's
+system is known but its category couldn't be mapped (only an `ANY` rule matched), or the mapped (system, category) has
+no playbook, the DEFAULT playbook runs and the execution is marked `triage_mode = "DefaultRCA"` with a `triage_note`
+saying what to fix. Fix the mapping rule (or add the playbook) and Retry: retry re-classifies, so the specific playbook
+runs (`triage_mode = "Mapped"`). `GET /incidents/dashboard?triage_mode=DefaultRCA` lists what still needs mapping;
+`GET /stats/incidents` reports `default_rca`. Mapping rules can't use `DEFAULT`.
 
 **Scope:** only the FUNC category (`FUNCTIONAL DEFECT (QA/UAT)`) has shipped playbooks, and only a few real source
 systems have one; others report "no playbook configured" rather than a fabricated RCA. The engine is
@@ -254,8 +281,9 @@ Served on `:8421`; interactive docs at `/docs`. No authentication.
 | Health | `GET /health` |
 | Webhooks | `POST /webhooks/{teams,jira,servicenow}` |
 | Catalog | `/catalog/{teams,environments,source-systems,footprints,mapping-rules}` — `GET`, `POST`, `GET/PUT/DELETE /{id}`. References are checked on write; deleting a referenced row returns `409`. `footprints` and `mapping-rules` accept `?source_system_id=` |
-| Functions | `GET/POST /functions`, `GET/DELETE /functions/{id}`, `GET/POST /functions/{id}/versions`, `GET /functions/{id}/versions/{n}/source`. Responses include `has_implementation` |
-| Playbook builds | `POST/GET /workflows/build-requests`, `GET /workflows/build-requests/{id}`, `POST .../{id}/approve`, `POST .../{id}/reject` |
+| Functions | `GET/POST /functions`, `GET/DELETE /functions/{id}` (delete `409` while any playbook uses it), `GET/POST /functions/{id}/versions` (body `status: active\|draft`), `GET /functions/{id}/versions/{n}/source`, `GET .../{n}/usage`, `POST .../{n}/activate`, `POST .../{n}/retire` (`409` while pinned or active), `GET /functions/integrity`. Responses include `has_implementation` and `status` |
+| Playbook builds | `POST/GET /workflows/build-requests`, `GET /workflows/build-requests/{id}`, `POST .../{id}/dry-run` (runs it, persists nothing), `POST .../{id}/approve` (`422` if a task pins a draft/retired check version), `POST .../{id}/reject` |
+| Check-version pins | `GET /workflows/versions/{id}/pins` (pinned vs active version per task, with contract diff), `POST /workflows/definitions/{id}/upgrade` (`{base_version_id, calls: [..]\|"all", to: "active"\|N}` → build request) |
 | Playbook definitions | `GET /workflows/definitions`, `GET /workflows/definitions/{id}/versions`, `GET /workflows/active?source_system_id=&category=`, `POST /workflows/versions/{id}/execute` |
 | Playbook editing | `GET /workflows/versions/{id}/yaml`, `POST /workflows/render-yaml`, `POST /workflows/validate-yaml` (dry run), `POST /workflows/definitions/{id}/edits`. Validation errors are `422` with `{kind: syntax\|schema\|registry, errors: [{message, path, line, column, task_index}]}` |
 | Executions & feedback | `GET /workflows/executions[?incident_key=&jira_key=]`, `GET /workflows/executions/{id}`, `GET/POST /workflows/executions/{id}/feedback`, `GET /workflows/rca-patterns` |

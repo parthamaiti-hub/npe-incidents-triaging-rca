@@ -2,6 +2,8 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.categories import DEFAULT_CATEGORY
+
 
 class TeamIn(BaseModel):
     id: str
@@ -60,6 +62,16 @@ class IncidentMappingRuleIn(BaseModel):
     priority: int
     action: str
 
+    @field_validator("category")
+    @classmethod
+    def category_not_default(cls, v: str) -> str:
+        if v == DEFAULT_CATEGORY:
+            raise ValueError(
+                f"INCIDENT_MAPPING_RULE.category cannot be {DEFAULT_CATEGORY!r} -- the default playbook runs when no "
+                f"specific category/playbook is found; use 'ANY' for a rule that identifies only the system"
+            )
+        return v
+
     @field_validator("signal_pattern")
     @classmethod
     def pattern_must_compile(cls, v: str) -> str:
@@ -80,6 +92,10 @@ class TaskIn(BaseModel):
 
     name: str | None = None
     call: str
+    # Optional explicit check_type version pin (Sol-104). Omitted: the step
+    # keeps the pin it had in the previously loaded version of this
+    # playbook if unchanged, else gets the function's active version.
+    version: int | None = Field(default=None, ge=1)
     with_: dict = Field(default_factory=dict, alias="with")
     retry: dict | None = None
 

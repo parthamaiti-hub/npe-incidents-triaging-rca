@@ -76,14 +76,24 @@ class FunctionDefinition(Document):
 
 class FunctionDefinitionVersion(Document):
     """One immutable snapshot of a function's contract (description, typed
-    params, default retry policy). At most one version per function has
-    status='active' at a time (a partial unique index enforces it) --
-    publishing a new version supersedes the prior one, same pattern as
-    WorkflowDefinitionVersion. This is what a WorkflowDefinitionVersion's
-    document tasks pin via function_version_id (a plain string reference
-    inside the document, so a workflow can record exactly which function
-    contract version it was built/validated against, even after that
-    function's contract later changes)."""
+    params, default retry policy). This is what a WorkflowDefinitionVersion's
+    document tasks pin via function_version_id/function_version_number, so
+    a workflow records exactly which contract version it was built and
+    validated against, even after the function later changes.
+
+    Lifecycle (Sol-104): draft -> active -> deprecated -> retired.
+      - draft: published but not the default; may be pinned explicitly in
+        a build request to try it out, but a playbook pinning it can't be
+        approved until it is activated.
+      - active: the default for new pins. At most one per function (a
+        partial unique index enforces it).
+      - deprecated: a newer version became active; still runs for every
+        playbook pinned to it, may still be pinned explicitly.
+      - retired: never runs, never pinned. Only allowed once no approved or
+        superseded playbook version pins it.
+    `superseded` is what pre-Sol-104 code wrote for `deprecated`; it is
+    treated identically. Only `status` ever changes on a row -- the
+    contract itself is immutable."""
 
     COLLECTION: ClassVar[str] = "function_definition_version"
 
@@ -93,7 +103,7 @@ class FunctionDefinitionVersion(Document):
     description: str
     params: list[dict]
     default_retry: dict
-    status: Literal["active", "superseded"]
+    status: Literal["draft", "active", "deprecated", "retired", "superseded"]
     created_by: str
     created_at: datetime.datetime = Field(default_factory=utcnow)
 
@@ -248,6 +258,15 @@ class WorkflowExecution(Document):
     triggered_by: Literal["rca", "manual_execute", "retry", "auto"] = "manual_execute"
     requested_by: str | None = None
     mapping_overridden: bool = False
+    # How the playbook that ran was chosen (None when nothing ran, or for a
+    # direct /workflows/versions/{id}/execute):
+    #   Mapped     -- the incident's own (source_system, category) playbook;
+    #   DefaultRCA -- the source system's DEFAULT playbook, because the
+    #                 category couldn't be mapped or had no playbook (see
+    #                 triage_note); fix the mapping rule/playbook and Retry;
+    #   Override   -- an operator picked a different playbook version (Retry).
+    triage_mode: Literal["Mapped", "DefaultRCA", "Override"] | None = None
+    triage_note: str | None = None
     status: Literal["running", "completed", "failed"] = "running"
     started_at: datetime.datetime = Field(default_factory=utcnow)
     completed_at: datetime.datetime | None = None

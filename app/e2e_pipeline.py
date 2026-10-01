@@ -49,6 +49,10 @@ async def run_e2e_for_jira_key(
         # None when nothing ran (no playbook / not classified), not an empty list.
         "evidence": execution.evidence if execution.workflow_definition_version_id else None,
         "rca": execution.rca,
+        # "DefaultRCA" when the system's DEFAULT playbook ran because the
+        # category couldn't be mapped (triage_note says what to fix).
+        "triage_mode": execution.triage_mode,
+        "triage_note": execution.triage_note,
         "execution_id": execution.id,
         "comment_id": None,
     }

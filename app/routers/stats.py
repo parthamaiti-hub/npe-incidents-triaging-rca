@@ -31,6 +31,10 @@ class IncidentStatsOut(BaseModel):
     succeeded: int
     failed: int
     unidentified: int
+    # Of `total`: incidents whose latest run used the system's DEFAULT
+    # playbook (category not mapped) -- counted in succeeded/failed as
+    # usual, reported separately as the mapping work still to do.
+    default_rca: int = 0
     avg_process_seconds: float | None
 
 
@@ -66,6 +70,7 @@ async def incident_stats(period: str = "7d", db: AsyncDatabase = Depends(get_db)
         )
     )
     succeeded = total - unidentified - failed
+    default_rca = sum(1 for r in processed if r.latest_execution.triage_mode == "DefaultRCA")
 
     durations = [
         (r.latest_execution.completed_at - r.latest_execution.started_at).total_seconds()
@@ -79,5 +84,6 @@ async def incident_stats(period: str = "7d", db: AsyncDatabase = Depends(get_db)
         succeeded=succeeded,
         failed=failed,
         unidentified=unidentified,
+        default_rca=default_rca,
         avg_process_seconds=avg_process_seconds,
     )

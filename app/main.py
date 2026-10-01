@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from app.config import (
 )
 from app.db import ensure_indexes, get_database, make_mongo_client
 from app.events import declare_incidents_raw, make_channel, make_connection
+from app.function_lifecycle import check_function_integrity
 from app.function_registry import refresh_function_registry_from_db
 from app.idempotency import make_redis
 from app.routers.catalog import router as catalog_router
@@ -26,6 +28,8 @@ from app.routers.stats import router as stats_router
 from app.routers.workflows import router as workflows_router
 from app.vector_store import VectorStore, default_vector_store
 from app.webhooks import router as webhooks_router
+
+logger = logging.getLogger(__name__)
 
 
 def _vector_store_required() -> bool:
@@ -54,6 +58,12 @@ def create_app(
         try:
             await ensure_indexes(app.state.db)
             await refresh_function_registry_from_db(app.state.db)
+            # Sol-104: a pinned check version that can't run (missing,
+            # retired, code removed) is reported now, not when an incident
+            # hits it. Logged, not fatal -- GET /functions/integrity shows it.
+            for problem in await check_function_integrity(app.state.db):
+                log = logger.error if problem["severity"] == "error" else logger.warning
+                log("check_type integrity: %s", problem["message"])
         except Exception:
             # MongoDB unreachable at startup -- FUNCTION_REGISTRY keeps its
             # built-in defaults (exactly the fallback it's designed for), and

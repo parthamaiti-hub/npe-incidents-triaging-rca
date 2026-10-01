@@ -5,25 +5,23 @@ every execution reproducible.
 
 Async throughout (an AsyncDatabase handle) to match app.e2e_pipeline, its
 only current caller. dataloadscripts/load_catalog.py is sync and doesn't use this module
-directly -- it creates the initial static_authored version itself (a much
+directly -- it creates the static_authored versions itself (a much
 simpler bulk operation than the build/approve dance below), reusing
-app.workflow_spec.TaskSpec for the same validation rules.
+app.task_pinning for the same validation and version-pinning rules.
 """
 
-import json
 import uuid
 
-from pydantic import ValidationError
 from pymongo.asynchronous.database import AsyncDatabase
 from redis.asyncio import Redis
 
 from app import rca_status
-from app.checks import has_implementation
-from app.classification import FULLY_CLASSIFIED_STATUSES
+from app.categories import DEFAULT_CATEGORY
+from app.classification import ANY_CATEGORY_PENDING_LLM, FULLY_CLASSIFIED_STATUSES
 from app.config import RCA_SYNTHESIS_LLM_ENABLED
 from app.correlation import build_correlation_context, correlate_incident
 from app.db import in_transaction
-from app.function_registry import FUNCTION_REGISTRY
+from app.function_registry import active_version_number
 from app.idempotency import make_redis
 from app.models import (
     Incident,
@@ -37,17 +35,18 @@ from app.playbook_engine import execute_workflow
 from app.rca_synthesizer import synthesize_rca
 from app.rca_worker import publish_rca_pending
 from app.repositories.base import find_one, get, insert, max_version_number, update_fields
-from app.workflow_spec import TaskSpec
+from app.task_pinning import (  # WorkflowValidationError is re-exported: callers import it from here
+    ALL_CALLS,
+    WorkflowValidationError,
+    require_approvable,
+    resolve_tasks,
+)
 
 
-class WorkflowValidationError(ValueError):
-    """`errors` lists every failing task (an editor highlights all
-    broken steps at once, not just the first) as {task_index, path, message};
-    str(exc) stays the joined human-readable form existing callers use."""
-
-    def __init__(self, message: str, errors: list[dict] | None = None):
-        super().__init__(message)
-        self.errors = errors or []
+# WorkflowExecution.triage_mode values -- how the playbook that ran was chosen.
+MAPPED = "Mapped"
+DEFAULT_RCA = "DefaultRCA"
+OVERRIDE = "Override"
 
 
 class WorkflowConflictError(ValueError):
@@ -55,74 +54,11 @@ class WorkflowConflictError(ValueError):
     someone else published in the meantime."""
 
 
-def _task_error_message(exc: Exception) -> str:
-    if isinstance(exc, ValidationError):
-        return "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())
-    return str(exc)
-
-
-def _pin_key(task: dict) -> tuple:
-    """What makes a task 'unchanged' for pin preservation -- the name is
-    cosmetic, so it's left out; the function, its params and retry aren't."""
-    return (task.get("call"), json.dumps(task.get("with") or {}, sort_keys=True), json.dumps(task.get("retry"), sort_keys=True))
-
-
 def _validate_tasks(requested_functions: list[dict], preserve_pins_from: list[dict] | None = None) -> list[dict]:
-    """Validates each {call, with, retry?} against FUNCTION_REGISTRY (unknown
-    call or missing required param -> rejected before anything is stored),
-    stamps each task with the function's *current* function_version_id/
-    function_version_number (from the cache, so no extra DB round-trip --
-    FUNCTION_REGISTRY is kept in sync with the active FunctionDefinitionVersion
-    by app.function_registry's refresh/write paths), and rejects the build
-    if that exact version has no matching app.checks.STUB_RESULTS
-    entry -- publishing a function version's contract doesn't by itself make
-    it executable; a developer still has to add the matching implementation.
-
-    preserve_pins_from: when editing an existing version, a task
-    identical to one in that version keeps its existing pin instead of being
-    silently upgraded to the function's current version -- only added or
-    modified tasks get re-pinned.
-
-    Every task is checked; all failures are raised together. Returns the
-    compiled, spec-shaped task list."""
-    existing_pins: dict[tuple, dict] = {}
-    for old in preserve_pins_from or []:
-        if old.get("function_version_number") is not None:
-            existing_pins.setdefault(_pin_key(old), old)
-
-    tasks = []
-    errors: list[dict] = []
-    for i, raw in enumerate(requested_functions):
-        try:
-            task = TaskSpec.model_validate(raw)
-        except Exception as exc:
-            errors.append({"task_index": i, "path": f"requested_functions[{i}]", "message": _task_error_message(exc)})
-            continue
-
-        spec = FUNCTION_REGISTRY[task.call]
-        version_id, version_number = spec.version_id, spec.version_number or 1
-        pinned = existing_pins.get(_pin_key(task.model_dump(by_alias=True, exclude_none=True)))
-        if pinned is not None and has_implementation(task.call, pinned["function_version_number"]):
-            version_id, version_number = pinned.get("function_version_id"), pinned["function_version_number"]
-
-        if not has_implementation(task.call, version_number):
-            errors.append(
-                {
-                    "task_index": i,
-                    "path": f"requested_functions[{i}]",
-                    "message": f"{task.call!r} version {version_number} has a published contract but no "
-                    f"matching implementation in app.checks.STUB_RESULTS yet",
-                }
-            )
-            continue
-
-        task.function_version_id = version_id
-        task.function_version_number = version_number
-        tasks.append(task.model_dump(by_alias=True, exclude_none=True))
-
-    if errors:
-        raise WorkflowValidationError("; ".join(f"{e['path']}: {e['message']}" for e in errors), errors)
-    return tasks
+    """Validates and pins requested tasks -- see app.task_pinning.resolve_tasks
+    (explicit `version:` -> unchanged task keeps its base pin -> active),
+    validating each against the contract of the version it resolves to."""
+    return resolve_tasks(requested_functions, preserve_pins_from=preserve_pins_from)
 
 
 async def build_workflow_from_request(
@@ -208,6 +144,69 @@ async def edit_workflow_version(
     )
 
 
+async def upgrade_workflow_version(
+    db: AsyncDatabase,
+    definition_id: str,
+    base_version_id: str,
+    calls: list[str] | str,
+    requested_by: str,
+    to: int | str = "active",
+    change_note: str | None = None,
+) -> WorkflowBuildRequest:
+    """Moves the named tasks (or every task, calls="all") of the approved
+    version to a newer check version -- the function's active one, or an
+    explicit version number -- and leaves every other task on its existing
+    pin. Produces an ordinary rendered build request (an edit of the base
+    version), so approval, stale-base protection and history are exactly
+    those of any other edit. Raises WorkflowValidationError if a moved task
+    no longer satisfies the new version's contract (e.g. a newly required
+    param) -- the operator then adds the param through a normal edit."""
+    base = await get(db, WorkflowDefinitionVersion, base_version_id)
+    if base is None or base.workflow_definition_id != definition_id:
+        raise ValueError(f"No WorkflowDefinitionVersion {base_version_id!r} for definition {definition_id!r}")
+
+    document_calls = {task["call"] for task in base.document}
+    upgrade_all = calls == "all" or calls == [ALL_CALLS]
+    selected = document_calls if upgrade_all else set(calls)
+    unknown = sorted(selected - document_calls)
+    if unknown:
+        raise WorkflowValidationError(f"Not in v{base.version_number}: {unknown}")
+
+    tasks = []
+    for task in base.document:
+        requested = {k: task[k] for k in ("name", "call", "with", "retry") if task.get(k) is not None}
+        if task["call"] in selected:
+            target = active_version_number(task["call"]) if to == "active" else int(to)
+            if target is None:
+                raise WorkflowValidationError(f"{task['call']!r} has no active version to upgrade to")
+            requested["version"] = target
+        tasks.append(requested)
+
+    described = ", ".join(sorted(selected))
+    return await edit_workflow_version(
+        db,
+        definition_id,
+        base_version_id,
+        tasks,
+        requested_by,
+        change_note or f"Upgrade {described} to {to} (from v{base.version_number})",
+    )
+
+
+async def dry_run_build_request(db: AsyncDatabase, request_id: str) -> dict:
+    """Runs a rendered (not yet approved) build request's document and
+    synthesizes an RCA, persisting nothing -- the way to try a draft check
+    version, or an upgrade, before approving it. No incident is involved,
+    so correlation doesn't apply."""
+    request = await get(db, WorkflowBuildRequest, request_id)
+    if request is None:
+        raise ValueError(f"No WorkflowBuildRequest {request_id!r}")
+    if request.status != "rendered":
+        raise WorkflowValidationError(f"WorkflowBuildRequest {request_id!r} is {request.status!r}, not 'rendered'")
+    evidence = await execute_workflow(request.generated_document)
+    return {"build_request_id": request.id, "evidence": evidence, "rca": synthesize_rca(evidence)}
+
+
 async def approve_build_request(db: AsyncDatabase, request_id: str, approved_by: str) -> WorkflowDefinitionVersion:
     """Only an approved version becomes executable. Creates the
     WorkflowDefinition if this is its first version; supersedes any
@@ -221,6 +220,10 @@ async def approve_build_request(db: AsyncDatabase, request_id: str, approved_by:
         raise ValueError(f"No WorkflowBuildRequest {request_id!r}")
     if request.status != "rendered":
         raise ValueError(f"WorkflowBuildRequest {request_id!r} is {request.status!r}, not 'rendered'")
+    # Pins were valid when the request was rendered; a pinned check version
+    # may since have been retired, and a draft pin (allowed for dry-runs)
+    # must be activated before the playbook can become executable.
+    require_approvable(request.generated_document)
     if request.base_version_id is not None:
         base = await get(db, WorkflowDefinitionVersion, request.base_version_id)
         if base is not None:
@@ -294,6 +297,12 @@ async def get_active_workflow(
     return await find_one(db, WorkflowDefinitionVersion, {"workflow_definition_id": definition.id, "status": "approved"})
 
 
+async def get_default_workflow(db: AsyncDatabase, source_system_id: str) -> WorkflowDefinitionVersion | None:
+    """The source system's fallback playbook -- category DEFAULT, loaded
+    by dataloadscripts/load_default_playbooks.py -- or None if it has none."""
+    return await get_active_workflow(db, source_system_id, DEFAULT_CATEGORY)
+
+
 RETRYABLE_VERSION_STATUSES = ("approved", "superseded")
 
 
@@ -327,6 +336,8 @@ async def execute_and_record(
     requested_by: str | None = None,
     operator_context: str | None = None,
     redis_client: Redis | None = None,
+    triage_mode: str | None = None,
+    triage_note: str | None = None,
 ) -> WorkflowExecution:
     """Runs the interpreter and persists a reproducible record: a defensive
     snapshot of the exact document executed, the resulting evidence, and
@@ -335,7 +346,11 @@ async def execute_and_record(
 
     operator_context is operator-supplied free text from the
     Retry tab, persisted for audit and, once RCA_SYNTHESIS_LLM_ENABLED,
-    passed through to the LLM prompt as its own labeled tier."""
+    passed through to the LLM prompt as its own labeled tier.
+
+    triage_mode/triage_note record how the playbook was chosen (see
+    WorkflowExecution.triage_mode) -- kept off the RCA dict, which the LLM
+    RCA worker may rewrite later."""
     execution = WorkflowExecution(
         jira_key=jira_key,
         incident_id=incident_id,
@@ -346,6 +361,8 @@ async def execute_and_record(
         mapping_overridden=mapping_overridden,
         requested_by=requested_by,
         operator_context=operator_context,
+        triage_mode=triage_mode,
+        triage_note=triage_note,
         status="running",
     )
     await insert(db, execution)
@@ -435,7 +452,10 @@ def no_playbook_rca(source_system_id: str, category: str) -> dict:
         "rca_status": rca_status.NEED_MANUAL_INTERVENTION,
         "root_cause_summary": f"No RCA playbook configured yet for ({source_system_id}, {category}).",
         "contributing_factors": [],
-        "recommended_actions": ["Author an RCA_PLAYBOOK for this (source_system, category) pair"],
+        "recommended_actions": [
+            "Author an RCA_PLAYBOOK for this (source_system, category) pair",
+            "Or give the system a DEFAULT playbook (dataloadscripts/load_default_playbooks.py) so it gets a DefaultRCA",
+        ],
     }
 
 
@@ -460,38 +480,28 @@ async def run_rca_for_incident(
 ) -> WorkflowExecution:
     """One RCA attempt for an already-classified incident, recorded as a
     WorkflowExecution whatever the outcome: runs `version` if given (a
-    retry override), else the active playbook for the incident's
-    (source_system, category); records 'no playbook' / 'not classified'
-    when there is nothing to run. Shared by the worker's automatic RCA,
-    retry, and POST /rca/{jira_key}."""
+    retry override), else the playbook the classification selects (see
+    _select_playbook); records 'no playbook' / 'not classified' when there
+    is nothing to run. Shared by the worker's automatic RCA, retry, and
+    POST /rca/{jira_key}."""
+    selected, triage_mode, triage_note, unexecuted_rca = await _select_playbook(db, incident)
+
     if version is None:
-        if incident.classification_status not in FULLY_CLASSIFIED_STATUSES:
+        if selected is None:
             return await record_unexecuted_attempt(
                 db,
                 jira_key=incident.jira_key,
                 incident_id=incident.id,
-                rca=not_classified_rca(incident.classification_status),
+                rca=unexecuted_rca,
                 triggered_by=triggered_by,
                 requested_by=requested_by,
                 operator_context=operator_context,
             )
-        version = await get_active_workflow(db, incident.source_system_id, incident.category)
-        if version is None:
-            return await record_unexecuted_attempt(
-                db,
-                jira_key=incident.jira_key,
-                incident_id=incident.id,
-                rca=no_playbook_rca(incident.source_system_id, incident.category),
-                triggered_by=triggered_by,
-                requested_by=requested_by,
-                operator_context=operator_context,
-            )
-        mapping_overridden = False
+        version, mapping_overridden = selected, False
     else:
-        active = None
-        if incident.classification_status in FULLY_CLASSIFIED_STATUSES:
-            active = await get_active_workflow(db, incident.source_system_id, incident.category)
-        mapping_overridden = active is None or version.id != active.id
+        mapping_overridden = selected is None or version.id != selected.id
+        if mapping_overridden:
+            triage_mode, triage_note = OVERRIDE, None
 
     return await execute_and_record(
         db,
@@ -502,4 +512,53 @@ async def run_rca_for_incident(
         mapping_overridden=mapping_overridden,
         requested_by=requested_by,
         operator_context=operator_context,
+        triage_mode=triage_mode,
+        triage_note=triage_note,
     )
+
+
+async def _select_playbook(
+    db: AsyncDatabase, incident: Incident
+) -> tuple[WorkflowDefinitionVersion | None, str | None, str | None, dict | None]:
+    """The playbook an incident's classification selects, as
+    (version, triage_mode, triage_note, rca_if_nothing_runs):
+
+    1. fully classified and its (system, category) has an approved
+       playbook                                              -> that one, Mapped
+    2. the source system is known, but the category couldn't be mapped
+       (an ANY rule won and the LLM fallback didn't resolve it), or the
+       mapped (system, category) has no playbook, and the system has a
+       DEFAULT playbook                                      -> DEFAULT, DefaultRCA
+    3. otherwise nothing runs: 'no playbook' (system + category known)
+       or 'not classified' (system unknown, or category unknown and no
+       DEFAULT playbook).
+
+    A DefaultRCA run is a first look, not a mapped diagnosis: fix or add
+    the mapping rule (or the missing playbook) and Retry -- retry
+    re-classifies first, so the specific playbook then runs."""
+    status = incident.classification_status
+    system = incident.source_system_id
+
+    if status in FULLY_CLASSIFIED_STATUSES:
+        mapped = await get_active_workflow(db, system, incident.category)
+        if mapped is not None:
+            return mapped, MAPPED, None, None
+        default = await get_default_workflow(db, system)
+        if default is not None:
+            note = (
+                f"No playbook for ({system}, {incident.category}) -- ran {system}'s DEFAULT playbook. "
+                f"Add a playbook for that category (or correct the mapping rule), then Retry."
+            )
+            return default, DEFAULT_RCA, note, None
+        return None, None, None, no_playbook_rca(system, incident.category)
+
+    if status == ANY_CATEGORY_PENDING_LLM and system is not None:
+        default = await get_default_workflow(db, system)
+        if default is not None:
+            note = (
+                f"Source system {system} identified (rule {incident.matched_rule_id}) but the category couldn't be "
+                f"mapped -- ran {system}'s DEFAULT playbook. Add or fix a mapping rule for this incident, then Retry."
+            )
+            return default, DEFAULT_RCA, note, None
+
+    return None, None, None, not_classified_rca(status)

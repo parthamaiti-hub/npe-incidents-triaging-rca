@@ -22,6 +22,10 @@ REFERENCES: dict[str, list[tuple[str, str]]] = {
         ("incident", "source_system_id"),
     ],
     "incident_mapping_rule": [("incident", "matched_rule_id")],
+    # A check_type used by any stored playbook version (any status) can't
+    # be deleted -- that history must stay explainable and retry-able.
+    # Retire individual versions instead (POST /functions/{id}/versions/{n}/retire).
+    "function_definition": [("workflow_definition_version", "document.call")],
     "rca_pattern_type": [("rca_feedback", "corrected_pattern_id")],
 }
 

@@ -61,6 +61,8 @@ class RcaResultOut(BaseModel):
     classification: dict
     evidence: list[dict] | None
     rca: dict | None
+    triage_mode: str | None = None
+    triage_note: str | None = None
     execution_id: str | None
     comment_id: str | None
 
@@ -74,6 +76,10 @@ class IncidentDashboardOut(IncidentOut):
     latest_matched_pattern: str | None
     latest_execution_status: str | None
     latest_executed_at: datetime.datetime | None
+    # "DefaultRCA" when the latest run used the system's DEFAULT playbook
+    # because the category couldn't be mapped -- fix the rule, then Retry.
+    latest_triage_mode: str | None = None
+    latest_triage_note: str | None = None
 
 
 class IncidentDashboardPage(BaseModel):
@@ -114,6 +120,7 @@ async def incidents_dashboard(
     q: str | None = None,
     classification_status: str | None = None,
     rca_status: str | None = None,
+    triage_mode: str | None = None,
     source_system_id: str | None = None,
     category: str | None = None,
     date_from: datetime.datetime | None = None,
@@ -122,7 +129,8 @@ async def incidents_dashboard(
 ):
     """One row per incident, newest-processed-first, joined to its latest
     RCA attempt. Registered before /incidents/{incident_id}
-    so "dashboard" isn't swallowed as a path parameter."""
+    so "dashboard" isn't swallowed as a path parameter. triage_mode=DefaultRCA
+    lists the incidents whose mapping still needs fixing."""
     rows = await load_incidents_with_latest_execution(
         db,
         q=q,
@@ -134,6 +142,8 @@ async def incidents_dashboard(
     )
     if rca_status is not None:
         rows = [r for r in rows if r.latest_execution is not None and r.latest_execution.rca_status == rca_status]
+    if triage_mode is not None:
+        rows = [r for r in rows if r.latest_execution is not None and r.latest_execution.triage_mode == triage_mode]
 
     def sort_key(row):
         latest = row.latest_execution
@@ -151,6 +161,8 @@ async def incidents_dashboard(
             latest_matched_pattern=(row.latest_execution.rca or {}).get("matched_pattern") if row.latest_execution else None,
             latest_execution_status=row.latest_execution.status if row.latest_execution else None,
             latest_executed_at=row.latest_execution.started_at if row.latest_execution else None,
+            latest_triage_mode=row.latest_execution.triage_mode if row.latest_execution else None,
+            latest_triage_note=row.latest_execution.triage_note if row.latest_execution else None,
         )
         for row in page
     ]

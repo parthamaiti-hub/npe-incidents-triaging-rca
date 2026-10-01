@@ -48,6 +48,10 @@ class FunctionSpec(BaseModel):
     # requires app.checks, which this module deliberately doesn't import
     # (contract vs. implementation stay separate concerns).
     has_implementation: bool | None = None
+    # Lifecycle status of this version (Sol-104): draft | active |
+    # deprecated | retired (legacy rows may say superseded == deprecated).
+    # None for the built-in defaults, which behave as active.
+    status: str | None = None
 
     def required_param_names(self) -> set[str]:
         return {p.name for p in self.params if p.required}
@@ -177,33 +181,122 @@ DEFAULT_FUNCTION_REGISTRY: dict[str, FunctionSpec] = {
 # import sees live updates through the same dict object.
 FUNCTION_REGISTRY: dict[str, FunctionSpec] = dict(DEFAULT_FUNCTION_REGISTRY)
 
+# Every DB-backed version of every function, keyed (name, version_number)
+# -- not only the active one. A playbook task pinned to an older (or a
+# draft) version is validated and executed against *that* version's
+# contract, never the active one's (Sol-104 V4/V5). Same in-place-mutation
+# discipline as FUNCTION_REGISTRY.
+FUNCTION_VERSIONS: dict[tuple[str, int], FunctionSpec] = {}
 
-def reset_function_registry(entries: dict[str, FunctionSpec]) -> None:
+# Statuses a task may be pinned to. `draft` is allowed in a build request
+# (to try a new version out) but refused at approval -- see
+# app.task_pinning. `superseded` is the pre-Sol-104 name for `deprecated`.
+RUNNABLE_STATUSES = ("draft", "active", "deprecated", "superseded")
+
+
+def reset_function_registry(entries: dict[str, FunctionSpec], versions: dict[tuple[str, int], FunctionSpec] | None = None) -> None:
     FUNCTION_REGISTRY.clear()
     FUNCTION_REGISTRY.update(entries)
+    if versions is not None:
+        FUNCTION_VERSIONS.clear()
+        FUNCTION_VERSIONS.update(versions)
+
+
+def snapshot_function_registry() -> tuple[dict, dict]:
+    """For tests: (FUNCTION_REGISTRY, FUNCTION_VERSIONS) copies to hand back
+    to reset_function_registry afterwards."""
+    return dict(FUNCTION_REGISTRY), dict(FUNCTION_VERSIONS)
+
+
+def spec_from_row(row) -> FunctionSpec:
+    return FunctionSpec(
+        name=row.function_definition_id,
+        description=row.description,
+        params=[ParamSpec(**p) for p in row.params],
+        default_retry=RetryPolicy(**row.default_retry),
+        version_id=row.id,
+        version_number=row.version_number,
+        status=row.status,
+    )
+
+
+def cache_function_version(spec: FunctionSpec) -> None:
+    """Keeps both caches in step after one version row was written."""
+    FUNCTION_VERSIONS[(spec.name, spec.version_number)] = spec
+    if spec.status == "active":
+        FUNCTION_REGISTRY[spec.name] = spec
+    elif FUNCTION_REGISTRY.get(spec.name) is not None and FUNCTION_REGISTRY[spec.name].version_number == spec.version_number:
+        # This version was the active one and has just been demoted.
+        FUNCTION_REGISTRY[spec.name] = spec
+
+
+def forget_function(name: str) -> None:
+    FUNCTION_REGISTRY.pop(name, None)
+    for key in [k for k in FUNCTION_VERSIONS if k[0] == name]:
+        del FUNCTION_VERSIONS[key]
+
+
+def is_known_function(name: str) -> bool:
+    return name in FUNCTION_REGISTRY or any(k[0] == name for k in FUNCTION_VERSIONS)
+
+
+def active_version_number(name: str) -> int | None:
+    spec = FUNCTION_REGISTRY.get(name)
+    if spec is None:
+        return None
+    return spec.version_number or 1
+
+
+def get_function_spec(name: str, version_number: int) -> FunctionSpec | None:
+    """The contract of exactly (name, version_number), or None.
+
+    Falls back, in order, to the active spec when it *is* that version, and
+    to the built-in default for version 1 -- load_function_registry seeds
+    every v1 from DEFAULT_FUNCTION_REGISTRY, so on an unseeded database (or
+    in a process that hasn't refreshed from the DB) the default is v1's
+    contract by construction."""
+    spec = FUNCTION_VERSIONS.get((name, version_number))
+    if spec is not None:
+        return spec
+    active = FUNCTION_REGISTRY.get(name)
+    if active is not None and (active.version_number or 1) == version_number:
+        return active
+    if version_number == 1:
+        return DEFAULT_FUNCTION_REGISTRY.get(name)
+    return None
+
+
+def is_runnable(spec: FunctionSpec) -> bool:
+    return spec.status is None or spec.status in RUNNABLE_STATUSES
 
 
 async def refresh_function_registry_from_db(db) -> None:
-    """Reloads FUNCTION_REGISTRY from each function's *active*
-    FunctionDefinitionVersion. A no-op if there are no active versions
-    (collection not seeded yet) -- keeps the built-in defaults rather than
-    wiping them, so an unseeded DB doesn't break validation."""
+    """Reloads both caches from the database: FUNCTION_VERSIONS from every
+    FunctionDefinitionVersion, FUNCTION_REGISTRY from the active ones. A
+    no-op if the collection is empty (not seeded yet) -- keeps the built-in
+    defaults rather than wiping them, so an unseeded DB doesn't break
+    validation."""
     from app.models import FunctionDefinitionVersion
     from app.repositories.base import find
 
-    rows = await find(db, FunctionDefinitionVersion, {"status": "active"})
+    _load_rows(await find(db, FunctionDefinitionVersion))
+
+
+def refresh_function_registry_from_db_sync(db) -> None:
+    """Same as refresh_function_registry_from_db, for the sync load scripts
+    (dataloadscripts/load_catalog.py runs in its own process, so without
+    this it would only ever see the built-in defaults)."""
+    from app.models import FunctionDefinitionVersion
+
+    _load_rows([FunctionDefinitionVersion.from_doc(doc) for doc in db[FunctionDefinitionVersion.COLLECTION].find()])
+
+
+def _load_rows(rows) -> None:
     if not rows:
+        FUNCTION_VERSIONS.clear()
         return
+    specs = [spec_from_row(row) for row in rows]
     reset_function_registry(
-        {
-            row.function_definition_id: FunctionSpec(
-                name=row.function_definition_id,
-                description=row.description,
-                params=[ParamSpec(**p) for p in row.params],
-                default_retry=RetryPolicy(**row.default_retry),
-                version_id=row.id,
-                version_number=row.version_number,
-            )
-            for row in rows
-        }
+        {spec.name: spec for spec in specs if spec.status == "active"},
+        {(spec.name, spec.version_number): spec for spec in specs},
     )

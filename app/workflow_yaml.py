@@ -7,15 +7,22 @@ function_version_number?}; the YAML shape an operator edits is
     document: {dsl: '1.0.0', namespace: npe-rca, name: ..., version: '...'}
     do:
       - checkErrorLogs:
-          call: error_logs_v2
+          call: error_logs
+          version: 2
           with: {...}
           retry: {max_attempts: 3}
 
 Only the DSL subset app/workflow_spec.py executes is accepted: sequential
-`call` tasks with `with` params and an optional `retry` override. Anything
-else (switch/fork/emit/...) is rejected here, at parse time, with a
-line/column the editor can point at. Function pins are never part of the
-YAML -- they are server-stamped by app.workflow_orchestrator.
+`call` tasks with `with` params, an optional `retry` override and an
+optional `version`. Anything else (switch/fork/emit/...) is rejected here,
+at parse time, with a line/column the editor can point at.
+
+`version` is the check_type version the task runs (Sol-104). Rendering
+always shows the stored pin, so what an operator sees is exactly what runs;
+on input it is an explicit pin -- leave it out to get the function's active
+version (or, for a task unchanged from the base version, its existing pin).
+The server-only fields (function_version_id, resolved_retry) never appear
+in YAML.
 
 This module only checks *shape*; whether each `call` exists, has its
 required params, and has an implementation is app.workflow_orchestrator's
@@ -31,7 +38,7 @@ MAX_YAML_BYTES = 64 * 1024
 DSL_VERSION = "1.0.0"
 NAMESPACE = "npe-rca"
 
-_TASK_KEYS = {"call", "with", "retry"}
+_TASK_KEYS = {"call", "version", "with", "retry"}
 _RETRY_KEYS = {"max_attempts", "delay_seconds", "exponential_backoff"}
 _TOP_LEVEL_KEYS = {"document", "do"}
 _UNSUPPORTED_TASK_KINDS = {"switch", "fork", "emit", "listen", "for", "try", "raise", "run", "set", "wait", "do"}
@@ -90,7 +97,11 @@ def tasks_to_cncf_yaml(tasks: list[dict], *, name: str = "playbook", version: st
     used: set[str] = set()
     do = []
     for task in tasks:
-        body: dict = {"call": task["call"], "with": dict(task.get("with") or {})}
+        body: dict = {"call": task["call"]}
+        check_version = task.get("version") or task.get("function_version_number")
+        if check_version is not None:
+            body["version"] = check_version
+        body["with"] = dict(task.get("with") or {})
         if task.get("retry"):
             body["retry"] = dict(task["retry"])
         do.append({_task_key(task, used): body})
@@ -183,7 +194,7 @@ def cncf_yaml_to_tasks(text: str) -> ParsedWorkflow:
         for k in body:
             if k not in _TASK_KEYS and k not in _UNSUPPORTED_TASK_KINDS:
                 key_node, _ = _mapping_get(body_node, k)
-                issues.append(YamlIssue(f"unknown key '{k}' (allowed: call, with, retry)", f"{path}.{k}", *_line(key_node), i))
+                issues.append(YamlIssue(f"unknown key '{k}' (allowed: call, version, with, retry)", f"{path}.{k}", *_line(key_node), i))
         if unsupported:
             continue
 
@@ -206,6 +217,14 @@ def cncf_yaml_to_tasks(text: str) -> ParsedWorkflow:
         # tasks_to_cncf_yaml) -- keep it unnamed so a round trip is lossless.
         if task_name != call:
             task["name"] = task_name
+
+        version = body.get("version")
+        if version is not None:
+            if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                _, version_node = _mapping_get(body_node, "version")
+                issues.append(YamlIssue("must be a positive integer (a check_type version)", f"{path}.version", *_line(version_node), i))
+                continue
+            task["version"] = version
 
         retry = body.get("retry")
         if retry is not None:

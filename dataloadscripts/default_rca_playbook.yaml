@@ -1,0 +1,48 @@
+# ============================================
+# default_rca_playbook.yaml
+# Template for every source system's DEFAULT RCA playbook, loaded by
+#   uv run python -m dataloadscripts.load_default_playbooks
+#
+# The DEFAULT playbook runs when an incident's source system is known but
+# its category couldn't be mapped (or the mapped category has no playbook);
+# the run is marked triage_mode = "DefaultRCA". See
+# design/NPE_Incident_PlaybookMappingProcess.md §6.5.
+#
+# Steps mirror the FUNCTIONAL DEFECT (QA/UAT) playbooks (RCA_HSI_FUNC /
+# RCA_FIBER_FUNC). In any string value these placeholders are filled per
+# system:
+#   {code}       source system code, e.g. HSI
+#   {system_id}  source system id,   e.g. SYS_HSI
+#   {name}       source system name
+#
+# A step may pin `version: N` exactly as in a catalog playbook; without it
+# the step keeps its pin across reloads, else gets the active version.
+#
+# To give one system a different fallback, edit its DEFAULT playbook in the
+# UI (or author it in a catalog YAML under any id) -- this loader then
+# leaves it alone (see the script's docstring).
+# ============================================
+steps:
+  - call: error_logs
+    with:
+      env: NPE
+      app: "{code}"
+      lookback_minutes: 240
+  - call: recent_deployments
+    with:
+      env: NPE
+      app: "{code}"
+      lookback_minutes: 1440
+  - call: apm_traces
+    with:
+      env: NPE
+      app: "{code}"
+      lookback_minutes: 240
+      latency_threshold_ms: 2000
+  - call: dependent_services_health
+    with:
+      env: NPE
+      app: "{code}"
+      # Unknown per system in a generic fallback; the system's own
+      # playbooks list its real dependencies.
+      dependencies: []

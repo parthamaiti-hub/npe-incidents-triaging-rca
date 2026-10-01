@@ -2,6 +2,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from pymongo.asynchronous.database import AsyncDatabase
 
+from app.categories import RESERVED_CATEGORIES
 from app.config import CLASSIFICATION_CONFIDENCE_THRESHOLD, LLM_FALLBACK_ENABLED
 from app.embeddings import ClassificationCandidate, retrieve_classification_candidates
 from app.incident_parser import extract_signals
@@ -133,9 +134,13 @@ async def _valid_categories_for(db: AsyncDatabase, source_system_id: str) -> lis
     never an open catalog-wide list, so the LLM can never pick a category
     with no playbook to run."""
     rule_categories = await db[IncidentMappingRule.COLLECTION].distinct(
-        "category", {"source_system_id": source_system_id, "category": {"$ne": "ANY"}}
+        "category", {"source_system_id": source_system_id, "category": {"$nin": list(RESERVED_CATEGORIES)}}
     )
-    workflow_categories = await db[WorkflowDefinition.COLLECTION].distinct("category", {"source_system_id": source_system_id})
+    # DEFAULT is the fallback playbook, not a category an incident can be
+    # classified as -- the LLM never picks it.
+    workflow_categories = await db[WorkflowDefinition.COLLECTION].distinct(
+        "category", {"source_system_id": source_system_id, "category": {"$nin": list(RESERVED_CATEGORIES)}}
+    )
     return sorted({*rule_categories, *workflow_categories})
 
 

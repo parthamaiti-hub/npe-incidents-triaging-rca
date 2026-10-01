@@ -39,6 +39,22 @@ ERROR_SYSTEM_RE = re.compile(r'errorSystem"?\s*[:=]\s*"?([A-Za-z0-9_]+)', re.IGN
 TARGET_SYSTEM_RE = re.compile(r"TARGET_SYSTEM=([A-Za-z0-9_]+)", re.IGNORECASE)
 
 
+# Every signal_type extract_signals() can produce -- a mapping rule with any
+# other signal_type can never match (dataloadscripts/check_catalog.py
+# refuses it). Keep in step with extract_signals below.
+SIGNAL_TYPES = (
+    "url",
+    "hostname",
+    "table_name",
+    "pipeline_name",
+    "jira_key",
+    "application_id",
+    "error_system",
+    "title_segment",
+    "keyword",
+)
+
+
 def strip_html(html_body: str) -> str:
     """Both Teams message bodies and Jira's renderedFields.description are
     HTML -- strip tags before treating either as plain text."""

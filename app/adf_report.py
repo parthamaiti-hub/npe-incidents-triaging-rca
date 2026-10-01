@@ -85,6 +85,14 @@ def build_rca_comment_adf(result: dict) -> dict:
         )
     if classification.get("matched_rule_id"):
         content.append(_paragraph(_text("Matched Rule: ", strong=True), _text(str(classification["matched_rule_id"]))))
+    if result.get("triage_mode") == "DefaultRCA":
+        content.append(
+            _panel(
+                "warning",
+                _paragraph(_text("Triage: DefaultRCA", strong=True)),
+                _paragraph(_text(result.get("triage_note") or "The system's DEFAULT playbook was used.")),
+            )
+        )
 
     if result.get("evidence"):
         content.append(_heading(3, "Evidence"))
